@@ -239,6 +239,7 @@ class Rendition(Base):
     video_id = Column(UUID(as_uuid=False), ForeignKey("videos.id", ondelete="CASCADE"), nullable=False)
 
     name = Column(String)
+    is_original = Column(Boolean, nullable=False, default=False)
     height = Column(Integer, nullable=False)
     width = Column(Integer)
     video_bitrate = Column(Integer)

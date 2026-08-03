@@ -67,12 +67,14 @@ function initialSubtitleAppearance(): SubtitleAppearance {
 interface PlayerProviderProps {
   children: React.ReactNode;
   manifestUrl: string;
+  originalResolution?: { width: number; height: number };
   onError?: (error: Error) => void;
 }
 
 export function PlayerProvider({
   children,
   manifestUrl,
+  originalResolution,
   onError,
 }: PlayerProviderProps) {
   const videoRef = useRef<HTMLVideoElement>(null);
@@ -91,6 +93,7 @@ export function PlayerProvider({
   const hlsState = useHls({
     manifestUrl,
     videoRef,
+    originalResolution,
     onError,
     onReady: () => {
       const video = videoRef.current;

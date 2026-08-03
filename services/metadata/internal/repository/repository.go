@@ -46,6 +46,7 @@ type Rendition struct {
 	ID        string    `json:"id"`
 	VideoID   string    `json:"video_id"`
 	Name      string    `json:"name"`
+	IsOriginal bool     `json:"is_original"`
 	Bandwidth int       `json:"bandwidth"`
 	Width     int       `json:"width"`
 	Height    int       `json:"height"`
@@ -390,11 +391,12 @@ func (r *Repository) UpdateStatus(ctx context.Context, id, status string) error 
 	return err
 }
 
-func (r *Repository) CreateRendition(ctx context.Context, videoID, name, codec string, bandwidth, width, height int) (*Rendition, error) {
+func (r *Repository) CreateRendition(ctx context.Context, videoID, name, codec string, isOriginal bool, bandwidth, width, height int) (*Rendition, error) {
 	rend := &Rendition{
 		ID:        uuid.NewString(),
 		VideoID:   videoID,
 		Name:      name,
+		IsOriginal: isOriginal,
 		Codec:     codec,
 		Bandwidth: bandwidth,
 		Width:     width,
@@ -402,9 +404,9 @@ func (r *Repository) CreateRendition(ctx context.Context, videoID, name, codec s
 		CreatedAt: time.Now().UTC(),
 	}
 	_, err := r.pool.Exec(ctx, `
-		INSERT INTO renditions (id, video_id, name, codec, bandwidth, width, height, created_at)
-		VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
-	`, rend.ID, rend.VideoID, rend.Name, rend.Codec, rend.Bandwidth, rend.Width, rend.Height, rend.CreatedAt)
+		INSERT INTO renditions (id, video_id, name, is_original, codec, bandwidth, width, height, created_at)
+		VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
+	`, rend.ID, rend.VideoID, rend.Name, rend.IsOriginal, rend.Codec, rend.Bandwidth, rend.Width, rend.Height, rend.CreatedAt)
 	if err != nil {
 		return nil, err
 	}
@@ -413,7 +415,7 @@ func (r *Repository) CreateRendition(ctx context.Context, videoID, name, codec s
 
 func (r *Repository) ListRenditions(ctx context.Context, videoID string) ([]*Rendition, error) {
 	rows, err := r.pool.Query(ctx, `
-		SELECT id, video_id, name, codec, bandwidth, width, height, master_url, created_at
+		SELECT id, video_id, name, is_original, codec, bandwidth, width, height, master_url, created_at
 		FROM renditions WHERE video_id = $1 ORDER BY bandwidth DESC
 	`, videoID)
 	if err != nil {
@@ -423,7 +425,7 @@ func (r *Repository) ListRenditions(ctx context.Context, videoID string) ([]*Ren
 	var list = []*Rendition{}
 	for rows.Next() {
 		rend := &Rendition{}
-		if err := rows.Scan(&rend.ID, &rend.VideoID, &rend.Name, &rend.Codec, &rend.Bandwidth, &rend.Width, &rend.Height, &rend.MasterURL, &rend.CreatedAt); err != nil {
+		if err := rows.Scan(&rend.ID, &rend.VideoID, &rend.Name, &rend.IsOriginal, &rend.Codec, &rend.Bandwidth, &rend.Width, &rend.Height, &rend.MasterURL, &rend.CreatedAt); err != nil {
 			return nil, err
 		}
 		list = append(list, rend)

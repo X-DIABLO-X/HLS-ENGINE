@@ -1,5 +1,9 @@
 export interface Rendition {
   id: string;
+  name?: string;
+  is_original?: boolean;
+  /** Set for the matching HLS level after the manifest is parsed. */
+  isOriginal?: boolean;
   width: number;
   height: number;
   bitrate: number;

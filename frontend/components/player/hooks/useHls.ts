@@ -6,6 +6,7 @@ import { displayLanguage } from '../language';
 export interface UseHlsOptions {
   manifestUrl: string;
   videoRef: React.RefObject<HTMLVideoElement | null>;
+  originalResolution?: { width: number; height: number };
   onError?: (error: Error) => void;
   onReady?: () => void;
 }
@@ -27,7 +28,10 @@ export interface UseHlsReturn {
   setSubtitleTrack: (index: number) => void;
 }
 
-function mapRenditions(hlsLevels: Level[]): Rendition[] {
+function mapRenditions(
+  hlsLevels: Level[],
+  originalResolution?: { width: number; height: number }
+): Rendition[] {
   return hlsLevels.map((level, index) => ({
     id: `level-${index}`,
     width: level.width,
@@ -35,6 +39,9 @@ function mapRenditions(hlsLevels: Level[]): Rendition[] {
     bitrate: level.bitrate,
     codec: level.codecSet,
     frameRate: level.frameRate,
+    isOriginal:
+      originalResolution?.width === level.width &&
+      originalResolution.height === level.height,
   }));
 }
 
@@ -80,7 +87,7 @@ function isSubtitleError(data: { details?: unknown; frag?: { type?: unknown } })
 }
 
 export function useHls(options: UseHlsOptions): UseHlsReturn {
-  const { manifestUrl, videoRef, onError, onReady } = options;
+  const { manifestUrl, videoRef, originalResolution, onError, onReady } = options;
   const hlsRef = useRef<Hls | null>(null);
   // hls.js rebuilds its audio-track list when it parses or reloads a master
   // playlist. Keep an explicit user choice outside React state so that a
@@ -134,7 +141,7 @@ export function useHls(options: UseHlsOptions): UseHlsReturn {
       });
 
       hls.on(Hls.Events.MANIFEST_PARSED, (_event, data) => {
-        setLevels(mapRenditions(data.levels));
+        setLevels(mapRenditions(data.levels, originalResolution));
         setCurrentLevel(-1);
         setActiveLevel(hls.currentLevel);
         setAudioTracks(mapAudioTracks(hls.audioTracks));
@@ -243,7 +250,7 @@ export function useHls(options: UseHlsOptions): UseHlsReturn {
       hls?.destroy();
       hlsRef.current = null;
     };
-  }, [manifestUrl, videoRef]);
+  }, [manifestUrl, originalResolution, videoRef]);
 
   const setLevel = (level: number) => {
     const hls = hlsRef.current;

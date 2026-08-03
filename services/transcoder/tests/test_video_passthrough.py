@@ -665,7 +665,7 @@ class _PipelineSession:
 
 
 class DirectPlayPipelineRoutingTests(unittest.TestCase):
-    def test_pipeline_routes_remux_to_cpu_and_forces_chunking_off(self):
+    def test_pipeline_copies_original_and_keeps_adaptive_ladder(self):
         job = SimpleNamespace(
             id="job-direct-route",
             video_id="video-direct-route",
@@ -679,7 +679,7 @@ class DirectPlayPipelineRoutingTests(unittest.TestCase):
             complexity_score=None,
             encoding_strategy=None,
         )
-        sessions = [_PipelineSession(job) for _ in range(3)]
+        sessions = [_PipelineSession(job) for _ in range(4)]
         dispatched = Mock()
         chord_factory = Mock(return_value=dispatched)
         fallback_ladder = [
@@ -769,38 +769,27 @@ class DirectPlayPipelineRoutingTests(unittest.TestCase):
             )
 
         self.assertEqual(result["status"], "dispatched")
-        analyze.assert_not_called()
+        analyze.assert_called_once()
         outer_header = chord_factory.call_args.args[0]
-        video_signatures = [
+        original_signatures = [
             signature
             for signature in outer_header.tasks
             if str(getattr(signature, "task", "")).endswith(
-                "transcode_group"
+                "transcode_video"
             )
         ]
-        self.assertEqual(len(video_signatures), 1)
-        direct_signature = video_signatures[0]
+        self.assertEqual(len(original_signatures), 1)
+        original_signature = original_signatures[0]
         self.assertEqual(
-            direct_signature.options.get("queue"),
-            pipeline.CPU_VIDEO_QUEUE,
-        )
-        self.assertEqual(len(direct_signature.args[2]), 1)
-        self.assertEqual(direct_signature.args[2][0]["height"], 1080)
-        direct_settings = direct_signature.args[4]
-        self.assertFalse(direct_settings["chunked_encoding"])
-        self.assertTrue(
-            direct_settings["_video_direct_play"][
-                "fallback_use_chunked"
-            ]
-        )
-        self.assertEqual(
-            direct_settings["_video_direct_play"]["fallback_queue"],
+            original_signature.options.get("queue"),
             pipeline.GPU_VIDEO_QUEUE,
         )
-        self.assertEqual(
-            video.encoding_strategy,
-            transcode_tasks.DIRECT_PLAY_PENDING,
-        )
+        original = original_signature.args[2]
+        self.assertEqual(original["name"], "Original")
+        self.assertTrue(original["is_original"])
+        self.assertTrue(original["direct_play"])
+        self.assertEqual((original["width"], original["height"]), (1920, 1080))
+        self.assertEqual(video.encoding_strategy, "per_title")
 
 
 if __name__ == "__main__":

@@ -12,7 +12,12 @@ const qualityPresets = [
   { width: 256, label: '144p' },
 ];
 
-function qualityLabel(width: number, height: number): string {
+function qualityLabel(
+  width: number,
+  height: number,
+  isOriginal = false
+): string {
+  if (isOriginal) return `Original (${width}×${height})`;
   const preset = qualityPresets.find((item) => Math.abs(item.width - width) <= 2);
   return preset ? `${preset.label} (${width}×${height})` : `${height}p (${width}×${height})`;
 }
@@ -35,7 +40,11 @@ export function QualitySelector() {
         <span>Auto</span>
         {activeLevel >= 0 && levels[activeLevel] && (
           <span className="text-xs tabular-nums text-white/50">
-            Playing {qualityLabel(levels[activeLevel].width, levels[activeLevel].height)}
+            Playing {qualityLabel(
+              levels[activeLevel].width,
+              levels[activeLevel].height,
+              levels[activeLevel].isOriginal
+            )}
           </span>
         )}
       </button>
@@ -49,7 +58,7 @@ export function QualitySelector() {
           }`}
           aria-pressed={currentLevel === index}
         >
-          <span>{qualityLabel(level.width, level.height)}</span>
+          <span>{qualityLabel(level.width, level.height, level.isOriginal)}</span>
           <span className="flex items-center gap-2 text-xs tabular-nums text-white/50">
             {activeLevel === index && currentLevel !== -1 && (
               <span className="rounded bg-white/10 px-1.5 py-0.5 text-[10px] font-medium uppercase tracking-wide text-white/75">

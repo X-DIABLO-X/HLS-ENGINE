@@ -422,6 +422,7 @@ func (s *server) getEmbedManifest(w http.ResponseWriter, r *http.Request) {
 
 type createRenditionReq struct {
 	Name      string `json:"name"`
+	IsOriginal bool   `json:"is_original"`
 	Codec     string `json:"codec"`
 	Bandwidth int    `json:"bandwidth"`
 	Width     int    `json:"width"`
@@ -435,7 +436,7 @@ func (s *server) createRendition(w http.ResponseWriter, r *http.Request) {
 		respondError(w, http.StatusBadRequest, "invalid json")
 		return
 	}
-	rend, err := s.repo.CreateRendition(r.Context(), id, req.Name, req.Codec, req.Bandwidth, req.Width, req.Height)
+	rend, err := s.repo.CreateRendition(r.Context(), id, req.Name, req.Codec, req.IsOriginal, req.Bandwidth, req.Width, req.Height)
 	if err != nil {
 		respondError(w, http.StatusInternalServerError, "internal error")
 		return

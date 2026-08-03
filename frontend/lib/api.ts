@@ -5,6 +5,7 @@ import {
   Video,
   VideoListResponse,
   ProcessingProgress,
+  Rendition,
   TranscodingSettings,
 } from '@/types/video';
 import { useAuthStore } from '@/lib/auth';
@@ -74,6 +75,11 @@ export async function getVideos(
 
 export async function getVideo(id: string): Promise<Video> {
   const { data } = await api.get<Video>(`/videos/${id}`);
+  return data;
+}
+
+export async function getRenditions(id: string): Promise<Rendition[]> {
+  const { data } = await api.get<Rendition[]>(`/videos/${id}/renditions`);
   return data;
 }
 

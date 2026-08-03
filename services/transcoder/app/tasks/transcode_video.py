@@ -213,6 +213,10 @@ def _run_transcode_video(
         )
 
         task_name = f"transcode_{height}p"
+        is_direct_original = bool(
+            spec.get("is_original") and spec.get("direct_play")
+        )
+        display_name = "Original" if spec.get("is_original") else f"{height}p"
 
         work_dir = os.path.join(get_settings().WORK_DIR, job_id)
         canonical_output = os.path.join(work_dir, "output")
@@ -254,7 +258,7 @@ def _run_transcode_video(
                 progress_tracker.start_task(
                     video_id,
                     task_name,
-                    f"Transcoding {height}p video",
+                    f"Preparing {display_name} video",
                     job_id=job_id,
                 )
                 progress_started = True
@@ -289,7 +293,7 @@ def _run_transcode_video(
         progress_tracker.start_task(
             video_id,
             task_name,
-            f"Transcoding {height}p video",
+            f"Preparing {display_name} video",
             job_id=job_id,
         )
         progress_started = True
@@ -306,7 +310,7 @@ def _run_transcode_video(
                 video_id,
                 task_name,
                 pct,
-                f"Transcoding {height}p video",
+                f"Preparing {display_name} video",
                 job_id=job_id,
             )
 
@@ -318,11 +322,11 @@ def _run_transcode_video(
             attempt_output,
             f"video_{height}p",
         )
-        try:
+        def encode_original(force_gpu: bool) -> None:
             cmd = ffmpeg_utils.transcode_video_command(
                 local_source, attempt_rendition,
                 width, height, bitrate, fps,
-                force_gpu=use_gpu,
+                force_gpu=force_gpu,
                 segment_duration=seg_dur,
                 preset=preset,
                 codec=spec["codec"],
@@ -330,26 +334,62 @@ def _run_transcode_video(
                 nvenc_profile=nvenc_profile,
             )
             ffmpeg_utils.run_cmd_with_progress(cmd, duration, on_progress)
-        except ffmpeg_utils.FFmpegError as exc:
-            if use_gpu:
+
+        if is_direct_original:
+            try:
+                cmd = ffmpeg_utils.remux_h264_hls_command(
+                    local_source,
+                    attempt_rendition,
+                    segment_duration=seg_dur,
+                    segment_format=seg_fmt,
+                )
+                ffmpeg_utils.run_cmd_with_progress(cmd, duration, on_progress)
+                _validate_direct_play_output(
+                    attempt_rendition,
+                    spec,
+                    seg_fmt,
+                    duration,
+                    fps,
+                    seg_dur,
+                )
+            except Exception as exc:
+                # Original remains mandatory. A remux issue (for example a
+                # sparse keyframe layout) falls back to a source-size H.264
+                # encode instead of removing Original from the ladder.
+                logger.warning(
+                    "Original remux failed for job=%s; encoding source-size "
+                    "fallback: %s",
+                    job_id,
+                    exc,
+                )
+                _remove_rendition_directories(attempt_output, [height])
+                spec["direct_play"] = False
+                spec.pop("profile", None)
+                spec.pop("level", None)
+                try:
+                    encode_original(use_gpu)
+                except ffmpeg_utils.FFmpegError as encode_exc:
+                    if not use_gpu:
+                        raise
+                    logger.warning(
+                        "Original GPU fallback failed for job=%s; using CPU: %s",
+                        job_id,
+                        encode_exc,
+                    )
+                    _remove_rendition_directories(attempt_output, [height])
+                    encode_original(False)
+        else:
+            try:
+                encode_original(use_gpu)
+            except ffmpeg_utils.FFmpegError as exc:
+                if not use_gpu:
+                    raise
                 logger.warning(
                     "GPU transcode failed for job=%s, falling back to CPU: %s",
                     job_id, exc,
                 )
                 _remove_rendition_directories(attempt_output, [height])
-                cmd = ffmpeg_utils.transcode_video_command(
-                    local_source, attempt_rendition,
-                    width, height, bitrate, fps,
-                    force_gpu=False,
-                    segment_duration=seg_dur,
-                    preset=preset,
-                    codec=spec["codec"],
-                    segment_format=seg_fmt,
-                    nvenc_profile=nvenc_profile,
-                )
-                ffmpeg_utils.run_cmd_with_progress(cmd, duration, on_progress)
-            else:
-                raise
+                encode_original(False)
 
         _validate_rendition_set(
             attempt_output,
@@ -507,10 +547,14 @@ def _normalize_renditions(renditions, video, codec: str) -> list:
             w = r.get("width") or ffmpeg_utils.width_for_height(
                 video.width or 1920, video.height or h, h
             )
-            norm.append({
+            normalized = {
                 "height": h, "width": w,
                 "bitrate": r["bitrate"], "codec": r.get("codec", codec),
-            })
+            }
+            for key in ("name", "is_original", "direct_play", "profile", "level"):
+                if key in r:
+                    normalized[key] = r[key]
+            norm.append(normalized)
     return norm
 
 
@@ -1098,6 +1142,8 @@ def _row_matches_rendition(
             == str(rendition["codec"] or "").lower()
             and str(row.profile or "").lower()
             == _persisted_rendition_profile(rendition).lower()
+            and bool(getattr(row, "is_original", False))
+            == bool(rendition.get("is_original", False))
         )
     except (TypeError, ValueError):
         return False
@@ -1175,6 +1221,8 @@ def _completed_rendition_results(
             ),
         )
         details[height] = {
+            "name": getattr(row, "name", None) or f"{height}p",
+            "is_original": bool(getattr(row, "is_original", False)),
             "height": height,
             "width": rendition["width"],
             "bandwidth": row.bandwidth or 1,
@@ -1237,6 +1285,7 @@ def _persisted_rendition_profile(rendition: dict) -> str:
     """Keep encoded metadata stable and preserve direct source AVC metadata."""
     if (
         str(rendition.get("codec") or "").strip().lower() == "h264"
+        and bool(rendition.get("direct_play"))
         and rendition.get("profile") is not None
         and rendition.get("level") is not None
     ):
@@ -1302,7 +1351,8 @@ def _prepare_rendition_rows(
             duration,
         )
         row.video_id = video_id
-        row.name = f"{height}p"
+        row.name = str(rendition.get("name") or f"{height}p")
+        row.is_original = bool(rendition.get("is_original", False))
         row.height = height
         row.width = rendition["width"]
         row.video_bitrate = rendition["bitrate"]
@@ -1319,6 +1369,8 @@ def _prepare_rendition_rows(
         row.bandwidth = bandwidth
         rows.append(row)
         details[height] = {
+            "name": row.name,
+            "is_original": row.is_original,
             "height": height,
             "width": rendition["width"],
             "bandwidth": bandwidth,

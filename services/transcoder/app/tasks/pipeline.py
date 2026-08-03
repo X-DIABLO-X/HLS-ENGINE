@@ -82,6 +82,38 @@ def _rendition_height(rendition) -> int:
     return rendition if isinstance(rendition, int) else rendition.get("height", 0)
 
 
+def _with_mandatory_original(
+    renditions: list,
+    probe_result: dict,
+    direct_play_eligible: bool,
+) -> tuple[dict, list]:
+    """Return the source-native Original track plus non-colliding ABR rungs."""
+    source_height = int(probe_result.get("height") or 0)
+    source_width = int(probe_result.get("width") or 0)
+    if source_height <= 0 or source_width <= 0:
+        raise ValueError("Original rendition requires valid source dimensions")
+    original = {
+        "name": "Original",
+        "is_original": True,
+        "height": source_height,
+        "width": source_width,
+        "bitrate": max(200_000, int(probe_result.get("video_bitrate") or 0)),
+        "codec": "h264",
+        "direct_play": bool(direct_play_eligible),
+        "profile": probe_result.get("video_profile"),
+        "level": probe_result.get("video_level"),
+    }
+    # The storage and durable row identity are height-based. A selected rung
+    # at the source height is covered by Original and must not create a second
+    # rendition targeting the same canonical HLS directory.
+    adaptive = [
+        rendition
+        for rendition in renditions
+        if _rendition_height(rendition) != source_height
+    ]
+    return original, adaptive
+
+
 def _partition_groups(renditions: list, gpu_count: int) -> list:
     """Split renditions into G balanced groups, largest renditions spread across GPUs.
 
@@ -161,19 +193,6 @@ def _partition_gpu_groups(renditions: list, status: list) -> list:
 def _video_queue(live_gpu_indices: list) -> str:
     """Route GPU work exclusively to NVENC workers, with explicit CPU fallback."""
     return GPU_VIDEO_QUEUE if live_gpu_indices else CPU_VIDEO_QUEUE
-
-
-def _renditions_request_h264(renditions: list, default_codec: str) -> bool:
-    """Reject direct play when any explicit rendition requests another codec."""
-    if str(default_codec or "").strip().lower() != "h264":
-        return False
-    for rendition in renditions or []:
-        if not isinstance(rendition, dict):
-            continue
-        requested = rendition.get("codec", default_codec)
-        if str(requested or "").strip().lower() != "h264":
-            return False
-    return True
 
 
 def _build_chunks(duration: float, chunk_duration: float) -> list:
@@ -312,18 +331,20 @@ def _run_pipeline(
     direct_play_requested = bool(
         settings.get("video_passthrough_enabled", False)
     )
-    direct_play_eligible, direct_play_reason = (
+    original_direct_play_eligible, direct_play_reason = (
         ffmpeg_utils.h264_direct_play_eligibility(probe_result, codec)
     )
-    if not _renditions_request_h264(renditions, codec):
-        direct_play_eligible = False
-        direct_play_reason = "an explicit rendition requests a non-h264 codec"
-    direct_play = direct_play_requested and direct_play_eligible
+    direct_play_eligible = original_direct_play_eligible
+    # The former all-ladder passthrough mode is intentionally not selected for
+    # new deliveries: it would publish only the source rendition and omit the
+    # requested ABR ladder.  Compatibility now applies to Original alone;
+    # every delivery still schedules the selected encoded variants alongside it.
+    direct_play = False
     if direct_play_requested:
         logger.info(
-            "[pipeline] H.264 direct-play job=%s eligible=%s reason=%s",
+            "[pipeline] Original-only H.264 stream-copy job=%s eligible=%s reason=%s",
             job_id,
-            direct_play,
+            original_direct_play_eligible,
             direct_play_reason,
         )
 
@@ -433,22 +454,19 @@ def _run_pipeline(
         except Exception as exc:
             logger.warning("[pipeline] failed to persist PerTitleAnalysis: %s", exc)
 
-    # Caller-provided renditions override the computed ladder. Direct play
-    # retains this complete ladder solely as its fail-safe replacement plan.
-    normal_renditions = renditions if renditions else ladder
+    # Caller-provided renditions override the computed ladder. The source
+    # rendition is published separately as the mandatory Original track; a
+    # numeric rung at the source height would collide with its HLS directory
+    # and provide no additional resolution, so Original owns that slot.
+    original_rendition, normal_renditions = _with_mandatory_original(
+        renditions if renditions else ladder,
+        probe_result,
+        direct_play_eligible,
+    )
     if direct_play:
-        selected_renditions = [
-            {
-                "height": int(probe_result["height"]),
-                "width": int(probe_result["width"]),
-                "bitrate": int(probe_result["video_bitrate"]),
-                "codec": "h264",
-                "profile": probe_result["video_profile"],
-                "level": int(probe_result["video_level"]),
-            }
-        ]
+        selected_renditions = [original_rendition]
     else:
-        selected_renditions = normal_renditions
+        selected_renditions = [original_rendition, *normal_renditions]
 
     audio_infos = probe_result.get("audio_tracks", [])
     if audio_languages:
@@ -559,24 +577,29 @@ def _run_pipeline(
         cpu_fallback_mode = False
         use_chunked = False
     elif cpu_fallback_mode:
-        cpu_groups, chunks = _cpu_fallback_plan(
-            video_duration,
-            selected_renditions,
-            settings,
-        )
-        routed_groups = [(None, group_rend) for group_rend in cpu_groups]
-        # A CPU-only deployment must never fall through to the feature-length
-        # grouped task, regardless of the optional CHUNKED_ENCODING setting.
-        use_chunked = True
-        chunk_dur = max(length for _start, length in chunks)
+        if normal_renditions:
+            cpu_groups, chunks = _cpu_fallback_plan(
+                video_duration,
+                normal_renditions,
+                settings,
+            )
+            routed_groups = [(None, group_rend) for group_rend in cpu_groups]
+            # A CPU-only deployment must never fall through to the feature-length
+            # grouped task, regardless of the optional CHUNKED_ENCODING setting.
+            use_chunked = True
+            chunk_dur = max(length for _start, length in chunks)
+        else:
+            routed_groups = []
+            chunks = []
+            use_chunked = False
     else:
-        if use_chunked:
+        if use_chunked and normal_renditions:
             validate_bounded_chunk_codecs(
-                selected_renditions,
+                normal_renditions,
                 codec,
             )
         routed_groups = _partition_gpu_groups(
-            selected_renditions,
+            normal_renditions,
             gpu_status,
         )
 
@@ -667,6 +690,19 @@ def _run_pipeline(
                     settings,
                 ).set(queue=video_queue)
             )
+
+    if not direct_play:
+        # Original is independent from the adaptive ladder: it remuxes a
+        # compatible H.264 source and falls back to one source-size encode
+        # without suppressing the requested 720p/480p jobs.
+        header_sigs.append(
+            transcode_video.s(
+                job_id,
+                source_url,
+                original_rendition,
+                settings,
+            ).set(queue=video_queue)
+        )
 
     for audio in audio_infos:
         header_sigs.append(extract_audio.s(job_id, source_url, audio, settings))

@@ -1,12 +1,13 @@
 'use client';
 
-import { useEffect, useState, useRef } from 'react';
+import { useEffect, useMemo, useState, useRef } from 'react';
 import Link from 'next/link';
 import { useParams } from 'next/navigation';
 import { Player } from '@/components/player/Player';
 import { AuthGuard } from '@/components/auth/AuthGuard';
 import {
   getVideo,
+  getRenditions,
   getSignedManifest,
   deleteVideo,
   retryVideo,
@@ -59,9 +60,18 @@ function VideoPlayerPageContent({ id }: { id: string }) {
     let cancelled = false;
 
     getVideo(id)
-      .then((videoData) => {
+      .then(async (videoData) => {
         if (cancelled) return;
-        setVideo(videoData);
+        try {
+          const renditions = await getRenditions(id);
+          if (cancelled) return;
+          setVideo({ ...videoData, renditions });
+        } catch {
+          // Renditions are enhancement metadata for the selector. Keep the
+          // player available if an older video has no rendition records yet.
+          if (cancelled) return;
+          setVideo(videoData);
+        }
       })
       .catch((err) => {
         if (cancelled) return;
@@ -78,6 +88,14 @@ function VideoPlayerPageContent({ id }: { id: string }) {
   }, [id]);
 
   const videoStatus = video?.status;
+  const originalResolution = useMemo(() => {
+    const original = video?.renditions?.find(
+      (rendition) => rendition.is_original
+    );
+    return original
+      ? { width: original.width, height: original.height }
+      : undefined;
+  }, [video?.renditions]);
 
   useEffect(() => {
     if (!id || videoStatus !== 'ready' || signedManifest) return;
@@ -225,6 +243,7 @@ function VideoPlayerPageContent({ id }: { id: string }) {
           <div className="space-y-6">
             <Player
               manifestUrl={resolveManifestUrl(signedManifest.url)}
+              originalResolution={originalResolution}
               title={video.title}
               poster={video.thumbnailUrl}
               onError={(err) => setError(err.message)}

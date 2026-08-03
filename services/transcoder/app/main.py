@@ -405,6 +405,8 @@ async def get_video(video_id: str):
             "frame_rate": video.frame_rate,
             "renditions": [
                 {
+                    "name": r.name,
+                    "is_original": bool(getattr(r, "is_original", False)),
                     "height": r.height,
                     "width": r.width,
                     "bandwidth": r.bandwidth,

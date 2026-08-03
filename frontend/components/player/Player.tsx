@@ -74,12 +74,19 @@ function PlayerInner({ title, poster }: { title?: string; poster?: string }) {
 
 interface PlayerProps {
   manifestUrl: string;
+  originalResolution?: { width: number; height: number };
   title?: string;
   poster?: string;
   onError?: (error: Error) => void;
 }
 
-export function Player({ manifestUrl, title, poster, onError }: PlayerProps) {
+export function Player({
+  manifestUrl,
+  originalResolution,
+  title,
+  poster,
+  onError,
+}: PlayerProps) {
   const [instanceKey, setInstanceKey] = useState(0);
 
   const handleError = useCallback(
@@ -93,6 +100,7 @@ export function Player({ manifestUrl, title, poster, onError }: PlayerProps) {
     <PlayerProvider
       key={`${manifestUrl}-${instanceKey}`}
       manifestUrl={manifestUrl}
+      originalResolution={originalResolution}
       onError={handleError}
     >
       <PlayerInner title={title} poster={poster} />
