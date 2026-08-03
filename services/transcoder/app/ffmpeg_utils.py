@@ -1393,35 +1393,20 @@ def _safe_start_time(stream: Dict[str, Any]) -> float:
         return 0.0
 
 
-def audio_delay_ms(stream: Dict[str, Any], video_start: float = 0.0) -> float:
-    """Compute the intentional audio delay (ms) encoded in source metadata.
+def audio_delay_ms(stream: Dict[str, Any], presentation_start: float = 0.0) -> float:
+    """Return the authored audio offset from the container presentation start.
 
-    delay = audio.start_time - video.start_time
+    A video's per-stream ``start_time`` is often codec delay (for example,
+    H.264 B-frame reordering), not the beginning of the presentation.  Using
+    it as the audio reference trims or pads every audio track even when the
+    streams are correctly synced.  Container start time is the common HLS
+    timeline instead.
 
-    A positive value means the audio is meant to start *after* the video
-    (e.g. an MP4 edit list that shifts audio forward). A negative value means
-    audio leads. We also honour an explicit `encoder_delay` tag when present
-    (some encoders write priming samples in milliseconds).
+    Codec priming metadata such as ``encoder_delay`` is deliberately ignored:
+    FFmpeg's decoder/encoder handles it and it is not a program-level A/V
+    offset.
     """
-    audio_start = _safe_start_time(stream)
-    delay_sec = audio_start - float(video_start or 0.0)
-
-    tags = stream.get("tags", {}) or {}
-    enc_delay = tags.get("encoder_delay")
-    if enc_delay is not None:
-        try:
-            # encoder_delay is usually in samples; convert using the stream
-            # sample rate when available, otherwise treat as ms.
-            sr = int(stream.get("sample_rate", 0) or 0)
-            ed = float(enc_delay)
-            if sr > 0:
-                delay_sec += ed / sr
-            else:
-                delay_sec += ed / 1000.0
-        except (TypeError, ValueError):
-            pass
-
-    return delay_sec * 1000.0
+    return (_safe_start_time(stream) - float(presentation_start or 0.0)) * 1000.0
 
 
 def _video_rotation(stream: Dict[str, Any]) -> float:
@@ -1496,10 +1481,11 @@ def parse_probe(probe: Dict[str, Any]) -> Dict[str, Any]:
     for s in audio + subtitles:
         s["language"] = lang(s)
 
+    presentation_start = _safe_start_time(fmt)
     video_start = _safe_start_time(video)
     for a in audio:
         a["start_time"] = _safe_start_time(a)
-        a["delay_ms"] = audio_delay_ms(a, video_start)
+        a["delay_ms"] = audio_delay_ms(a, presentation_start)
 
     return {
         "duration": duration,
@@ -2565,23 +2551,170 @@ def package_audio_command(input_path: str, output_dir: str, segment_duration: in
     ]
 
 
-def package_subtitle(input_path: str, output_dir: str, duration: float = 0) -> str:
-    """Copy VTT file to output dir and create a simple HLS playlist."""
-    os.makedirs(output_dir, exist_ok=True)
-    import shutil
+_WEBVTT_TIMING_RE = re.compile(
+    r"^(?P<leading>\s*)(?P<start>(?:\d{2,}:)?\d{2}:\d{2}(?:\.\d+)?)"
+    r"\s+-->\s+(?P<end>(?:\d{2,}:)?\d{2}:\d{2}(?:\.\d+)?)(?P<settings>.*)$"
+)
 
-    base = os.path.basename(input_path) or "subtitles.vtt"
-    dest = os.path.join(output_dir, base if base.endswith(".vtt") else "subtitles.vtt")
-    shutil.copyfile(input_path, dest)
+
+def _subtitle_mpegts_start_pts(segment_format: str) -> int:
+    """Return the first WebVTT timestamp-map PTS for the HLS format.
+
+    FFmpeg's MPEG-TS HLS muxer starts its transport timeline at 1.4 seconds,
+    whereas fMP4 output preserves our normalized zero-based presentation
+    timeline.  A fixed value shifts every subtitle cue in one of those two
+    formats, so packaging must use the rendition format selected for the job.
+    """
+    fmt = (segment_format or "fmp4").strip().lower()
+    if fmt == "fmp4":
+        return 0
+    if fmt == "ts":
+        return 126_000
+    raise ValueError(f"unsupported HLS segment format: {segment_format}")
+
+
+def _webvtt_seconds(value: str) -> float:
+    """Parse a WebVTT timestamp into seconds."""
+    parts = value.strip().split(":")
+    if len(parts) == 2:
+        hours = 0.0
+        minutes, seconds = parts
+    elif len(parts) == 3:
+        hours, minutes, seconds = parts
+    else:
+        raise ValueError(f"invalid WebVTT timestamp: {value}")
+    return float(hours) * 3600 + float(minutes) * 60 + float(seconds)
+
+
+def _webvtt_timestamp(seconds: float) -> str:
+    milliseconds = max(0, int(round(seconds * 1000)))
+    hours, milliseconds = divmod(milliseconds, 3_600_000)
+    minutes, milliseconds = divmod(milliseconds, 60_000)
+    whole_seconds, milliseconds = divmod(milliseconds, 1_000)
+    return f"{hours:02d}:{minutes:02d}:{whole_seconds:02d}.{milliseconds:03d}"
+
+
+def _webvtt_cues(content: str) -> Tuple[List[str], List[Tuple[List[str], float, float, int]]]:
+    """Return reusable header blocks and parsed cue blocks from a VTT file."""
+    normalized = content.lstrip("\ufeff").replace("\r\n", "\n").replace("\r", "\n")
+    blocks = [block for block in re.split(r"\n{2,}", normalized.strip()) if block.strip()]
+    if not blocks or not blocks[0].lstrip().startswith("WEBVTT"):
+        raise ValueError("subtitle input is not valid WebVTT")
+
+    header_blocks: List[str] = []
+    first_header = blocks[0].split("\n", 1)
+    if len(first_header) == 2 and first_header[1].strip():
+        header_blocks.append(first_header[1].strip())
+
+    cues: List[Tuple[List[str], float, float, int]] = []
+    for block in blocks[1:]:
+        lines = block.split("\n")
+        timing_index = next((i for i, line in enumerate(lines) if "-->" in line), -1)
+        match = _WEBVTT_TIMING_RE.match(lines[timing_index]) if timing_index >= 0 else None
+        if match is None:
+            header_blocks.append(block.strip())
+            continue
+        start = _webvtt_seconds(match.group("start"))
+        end = _webvtt_seconds(match.group("end"))
+        if end > start:
+            cues.append((lines, start, end, timing_index))
+    return header_blocks, cues
+
+
+def _subtitle_segment_content(
+    header_blocks: List[str],
+    cues: List[Tuple[List[str], float, float, int]],
+    segment_start: float,
+    segment_end: float,
+    mpegts_start_pts: int,
+) -> str:
+    """Build one standards-compliant, segment-local WebVTT document."""
+    mpegts = mpegts_start_pts + int(round(segment_start * 90_000))
+    header_lines = [
+        "WEBVTT",
+        f"X-TIMESTAMP-MAP=LOCAL:00:00:00.000,MPEGTS:{mpegts}",
+    ]
+    if header_blocks:
+        header_lines.extend(header_blocks)
+    cue_blocks: List[str] = []
+    for lines, start, end, timing_index in cues:
+        if start >= segment_end or end <= segment_start:
+            continue
+        cue_lines = list(lines)
+        match = _WEBVTT_TIMING_RE.match(cue_lines[timing_index])
+        if match is None:  # Defensive: parsing above already verified this.
+            continue
+        local_start = _webvtt_timestamp(max(start, segment_start) - segment_start)
+        local_end = _webvtt_timestamp(min(end, segment_end) - segment_start)
+        cue_lines[timing_index] = (
+            f"{match.group('leading')}{local_start} --> {local_end}{match.group('settings')}"
+        )
+        cue_blocks.append("\n".join(cue_lines))
+    # hls.js parses the timestamp map only before the first blank header line.
+    # Keep WEBVTT and X-TIMESTAMP-MAP adjacent, then separate cue blocks.
+    body = "\n".join(header_lines)
+    if cue_blocks:
+        body += "\n\n" + "\n\n".join(cue_blocks)
+    return body + "\n"
+
+
+def package_subtitle(
+    input_path: str,
+    output_dir: str,
+    duration: float = 0,
+    segment_duration: int = SEGMENT_DURATION,
+    segment_format: str = "fmp4",
+) -> str:
+    """Package WebVTT into timeline-aligned HLS subtitle segments.
+
+    A standalone multi-hour VTT referenced by one media-playlist entry omits
+    mandatory HLS timeline information and is rejected by strict clients.
+    Segmenting it alongside video produces small, seekable subtitle resources
+    with an ``X-TIMESTAMP-MAP`` for each transport-stream timeline position.
+    """
+    os.makedirs(output_dir, exist_ok=True)
+    with open(input_path, "r", encoding="utf-8-sig") as handle:
+        headers, cues = _webvtt_cues(handle.read())
+
+    try:
+        requested_duration = float(duration or 0)
+    except (TypeError, ValueError):
+        requested_duration = 0.0
+    cue_duration = max((end for _lines, _start, end, _index in cues), default=0.0)
+    total_duration = max(requested_duration, cue_duration)
+    segment_length = max(1, int(segment_duration or SEGMENT_DURATION))
+    segment_count = max(1, int(math.ceil(total_duration / segment_length)))
+    mpegts_start_pts = _subtitle_mpegts_start_pts(segment_format)
+
     playlist_path = os.path.join(output_dir, "subtitles.m3u8")
-    duration = max(0.0, float(duration or 0))
-    lines = ["#EXTM3U", "#EXT-X-VERSION:3", "#EXT-X-PLAYLIST-TYPE:VOD"]
-    if duration > 0:
-        lines.append(f"#EXTINF:{duration:.3f},")
-    lines.append(os.path.basename(dest))
+    lines = [
+        "#EXTM3U",
+        "#EXT-X-VERSION:6",
+        f"#EXT-X-TARGETDURATION:{segment_length}",
+        "#EXT-X-MEDIA-SEQUENCE:0",
+        "#EXT-X-PLAYLIST-TYPE:VOD",
+    ]
+    for index in range(segment_count):
+        segment_start = index * segment_length
+        segment_end = min(total_duration, segment_start + segment_length)
+        if segment_end <= segment_start:
+            segment_end = segment_start + segment_length
+        name = f"subtitles_{index:05d}.vtt"
+        with open(os.path.join(output_dir, name), "w", encoding="utf-8") as handle:
+            handle.write(
+                _subtitle_segment_content(
+                    headers,
+                    cues,
+                    segment_start,
+                    segment_end,
+                    mpegts_start_pts,
+                )
+            )
+        lines.append(f"#EXTINF:{segment_end - segment_start:.3f},")
+        lines.append(name)
     lines.append("#EXT-X-ENDLIST")
-    with open(playlist_path, "w", encoding="utf-8") as f:
-        f.write("\n".join(lines) + "\n")
+    with open(playlist_path, "w", encoding="utf-8") as handle:
+        handle.write("\n".join(lines) + "\n")
     return playlist_path
 
 

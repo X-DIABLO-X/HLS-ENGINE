@@ -55,6 +55,13 @@ function mapSubtitles(tracks: MediaPlaylist[]): Subtitle[] {
   }));
 }
 
+function isSubtitleError(data: { details?: unknown; frag?: { type?: unknown } }): boolean {
+  return (
+    data.frag?.type === 'subtitle' ||
+    (typeof data.details === 'string' && data.details.toLowerCase().includes('subtitle'))
+  );
+}
+
 export function useHls(options: UseHlsOptions): UseHlsReturn {
   const { manifestUrl, videoRef, onError, onReady } = options;
   const hlsRef = useRef<Hls | null>(null);
@@ -130,6 +137,14 @@ export function useHls(options: UseHlsOptions): UseHlsReturn {
       });
 
       hls.on(Hls.Events.ERROR, (_event, data) => {
+        // Subtitle playlists are optional. A bad or expired subtitle request
+        // must never turn a healthy A/V session into a fatal player error.
+        if (isSubtitleError(data)) {
+          hls.subtitleTrack = -1;
+          setCurrentSubtitleTrack(-1);
+          console.warn('Subtitle track was disabled after a loading error', data);
+          return;
+        }
         if (data.fatal) {
           let message = 'HLS playback error';
           switch (data.type) {

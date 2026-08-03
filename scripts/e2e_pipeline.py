@@ -700,6 +700,10 @@ def main() -> int:
                     raise RuntimeError(f"{kind} playlist {index} is not HLS")
                 if "#EXT-X-ENDLIST" not in body:
                     raise RuntimeError(f"{kind} playlist {index} is incomplete")
+                if kind == "subtitles" and "#EXT-X-TARGETDURATION:" not in body:
+                    raise RuntimeError(
+                        f"subtitle playlist {index} is missing target duration"
+                    )
                 object_uris = playlist_uris(body)
                 if not object_uris:
                     raise RuntimeError(f"{kind} playlist {index} has no media objects")
@@ -721,6 +725,21 @@ def main() -> int:
                             f"{kind} playlist {index} object {object_index} "
                             f"failed range playback: {edge_response.status_code}"
                         )
+                    if kind == "subtitles" and object_index == 0:
+                        subtitle_text = edge_response.content.decode(
+                            "utf-8-sig", errors="replace"
+                        )
+                        if (
+                            not subtitle_text.startswith("WEBVTT")
+                            or "X-TIMESTAMP-MAP=" not in subtitle_text
+                        ):
+                            raise RuntimeError(
+                                f"subtitle playlist {index} has no HLS timestamp map"
+                            )
+                        if "#EXT-X-MAP:" in variant and "MPEGTS:0" not in subtitle_text:
+                            raise RuntimeError(
+                                f"fMP4 subtitle playlist {index} has an incorrect timestamp base"
+                            )
                 published_playlists.append(
                     {
                         "type": kind,

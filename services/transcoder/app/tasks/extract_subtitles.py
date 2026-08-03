@@ -42,17 +42,22 @@ def _validate_subtitle_output(
         or "#EXT-X-ENDLIST" not in lines
     ):
         raise ValueError("subtitle playlist is incomplete")
+    if not any(line.startswith("#EXT-X-TARGETDURATION:") for line in lines):
+        raise ValueError("subtitle playlist is missing target duration")
     media = [line for line in lines if not line.startswith("#")]
-    if len(media) != 1:
-        raise ValueError("subtitle playlist must reference exactly one WebVTT")
-    referenced = os.path.abspath(os.path.join(playlist_dir, media[0]))
-    if os.path.normcase(referenced) != os.path.normcase(os.path.abspath(raw_path)):
-        # package_subtitle may copy the VTT into the output directory.
-        if (
-            not os.path.isfile(referenced)
-            or os.path.getsize(referenced) <= 0
-        ):
+    if not media:
+        raise ValueError("subtitle playlist contains no WebVTT segments")
+    for entry in media:
+        referenced = os.path.abspath(os.path.join(playlist_dir, entry))
+        if not os.path.isfile(referenced) or os.path.getsize(referenced) <= 0:
             raise ValueError("subtitle playlist references a missing WebVTT")
+        with open(referenced, "r", encoding="utf-8-sig") as handle:
+            segment_header = handle.read(256)
+        if (
+            not segment_header.startswith("WEBVTT")
+            or "X-TIMESTAMP-MAP=" not in segment_header
+        ):
+            raise ValueError("subtitle segment is missing its HLS timestamp map")
 
 
 def _run_extract_subtitles(self, job_id: str, source_url: str, sub_info: dict, settings: dict = None) -> dict:
@@ -173,7 +178,15 @@ def _run_extract_subtitles(self, job_id: str, source_url: str, sub_info: dict, s
 
         video = db.query(models.Video).filter(models.Video.id == video_id).first()
         duration = video.duration if video and video.duration else 0
-        playlist_path = ffmpeg_utils.package_subtitle(raw_path, playlist_dir, duration).replace("\\", "/")
+        segment_format = settings.get(
+            "segment_format", get_settings().HLS_SEGMENT_FORMAT
+        )
+        playlist_path = ffmpeg_utils.package_subtitle(
+            raw_path,
+            playlist_dir,
+            duration,
+            segment_format=segment_format,
+        ).replace("\\", "/")
         _validate_subtitle_output(playlist_dir, playlist_path, raw_path)
 
         job, _video = lock_current_job(db, job_id)
