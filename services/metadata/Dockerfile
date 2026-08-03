@@ -12,7 +12,7 @@ RUN go mod download
 COPY services/metadata /build/services/metadata
 RUN CGO_ENABLED=0 GOOS=linux go build -ldflags="-s -w" -o /metadata .
 
-FROM alpine:3.23.5
+FROM alpine:3.24.1
 
 RUN apk add --no-cache ca-certificates tzdata wget
 
