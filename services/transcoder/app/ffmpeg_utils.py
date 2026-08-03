@@ -813,7 +813,14 @@ def run_cmd_with_progress(
 
 
 def ffprobe(path: str) -> Dict[str, Any]:
-    """Return parsed ffprobe JSON for a media file."""
+    """Return ffprobe metadata enriched with initial packet timestamps.
+
+    A container's stream ``start_time`` is not always the timestamp of the
+    first decodable packet.  Matroska files in particular can declare a zero
+    stream start while a language track begins much later.  Independent HLS
+    audio packaging must preserve that real offset, so collect it during the
+    normal (once-per-upload) probe rather than guessing from stream metadata.
+    """
     cmd = [
         "ffprobe",
         "-v",
@@ -824,7 +831,68 @@ def ffprobe(path: str) -> Dict[str, Any]:
         "-show_format",
         path,
     ]
-    return json.loads(run_cmd(cmd).stdout)
+    probe = json.loads(run_cmd(cmd).stdout)
+    streams = probe.get("streams", [])
+    if not isinstance(streams, list):
+        return probe
+
+    video_seen = 0
+    audio_seen = 0
+    for stream in streams:
+        if not isinstance(stream, dict):
+            continue
+        codec_type = stream.get("codec_type")
+        if codec_type == "video":
+            selector = f"v:{video_seen}"
+            video_seen += 1
+        elif codec_type == "audio":
+            selector = f"a:{audio_seen}"
+            audio_seen += 1
+        else:
+            continue
+        first_packet_time = _ffprobe_first_packet_time(path, selector)
+        if first_packet_time is not None:
+            stream["first_packet_time"] = first_packet_time
+    return probe
+
+
+def _ffprobe_first_packet_time(path: str, selector: str) -> Optional[float]:
+    """Return the first presentation timestamp for one selected stream.
+
+    The very short interval intentionally seeks to the start of the file.
+    ffprobe returns the first packet of a stream even when that stream has an
+    authored leading gap, without scanning the entire upload.
+    """
+    cmd = [
+        "ffprobe",
+        "-v",
+        "error",
+        "-select_streams",
+        selector,
+        "-read_intervals",
+        "0%+0.001",
+        "-show_packets",
+        "-show_entries",
+        "packet=pts_time",
+        "-of",
+        "json",
+        path,
+    ]
+    try:
+        payload = json.loads(run_cmd(cmd).stdout)
+        packets = payload.get("packets", [])
+        if not isinstance(packets, list) or not packets:
+            return None
+        value = packets[0].get("pts_time")
+        timestamp = float(value)
+        return timestamp if math.isfinite(timestamp) else None
+    except (FFmpegError, OSError, ValueError, TypeError, json.JSONDecodeError) as exc:
+        logger.warning(
+            "[ffprobe] unable to read initial packet timestamp for %s: %s",
+            selector,
+            exc,
+        )
+        return None
 
 
 def ffprobe_video_packets(path: str) -> List[Dict[str, Any]]:
@@ -1393,6 +1461,19 @@ def _safe_start_time(stream: Dict[str, Any]) -> float:
         return 0.0
 
 
+def _effective_start_time(stream: Dict[str, Any]) -> float:
+    """Return a stream's first decodable PTS, with metadata as fallback."""
+    value = stream.get("first_packet_time")
+    if value is not None:
+        try:
+            timestamp = float(value)
+            if math.isfinite(timestamp):
+                return timestamp
+        except (TypeError, ValueError):
+            pass
+    return _safe_start_time(stream)
+
+
 def audio_delay_ms(stream: Dict[str, Any], video_start: float = 0.0) -> float:
     """Return the source audio/video presentation offset in milliseconds.
 
@@ -1405,7 +1486,7 @@ def audio_delay_ms(stream: Dict[str, Any], video_start: float = 0.0) -> float:
     FFmpeg's decoder/encoder handles it and it is not a program-level A/V
     offset.
     """
-    return (_safe_start_time(stream) - float(video_start or 0.0)) * 1000.0
+    return (_effective_start_time(stream) - float(video_start or 0.0)) * 1000.0
 
 
 def _video_rotation(stream: Dict[str, Any]) -> float:
@@ -1480,9 +1561,12 @@ def parse_probe(probe: Dict[str, Any]) -> Dict[str, Any]:
     for s in audio + subtitles:
         s["language"] = lang(s)
 
-    video_start = _safe_start_time(video)
+    video_start = _effective_start_time(video)
     for a in audio:
+        # Preserve the declared timestamp for diagnostics, but calculate HLS
+        # alignment from the first packet whenever ffprobe could determine it.
         a["start_time"] = _safe_start_time(a)
+        a["effective_start_time"] = _effective_start_time(a)
         a["delay_ms"] = audio_delay_ms(a, video_start)
 
     return {

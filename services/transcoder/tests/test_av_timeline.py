@@ -38,6 +38,32 @@ class AudioTimelineTests(unittest.TestCase):
 
         self.assertEqual(parsed["audio_tracks"][0]["delay_ms"], 395.0)
 
+    def test_first_packet_timestamp_overrides_incorrect_declared_start_time(self):
+        parsed = ffmpeg_utils.parse_probe(
+            {
+                "format": {"start_time": "0.000", "duration": "60"},
+                "streams": [
+                    {
+                        "codec_type": "video",
+                        "start_time": "0.105",
+                        "first_packet_time": 0.105,
+                    },
+                    {
+                        "codec_type": "audio",
+                        # Matroska can declare zero even when the first AAC
+                        # packet deliberately starts later in the program.
+                        "start_time": "0.000",
+                        "first_packet_time": 13.843,
+                    },
+                ],
+            }
+        )
+
+        audio = parsed["audio_tracks"][0]
+        self.assertEqual(audio["start_time"], 0.0)
+        self.assertEqual(audio["effective_start_time"], 13.843)
+        self.assertEqual(audio["delay_ms"], 13738.0)
+
 
 class SubtitlePackagingTests(unittest.TestCase):
     def test_packages_short_hls_webvtt_segments_with_timestamp_maps(self):
