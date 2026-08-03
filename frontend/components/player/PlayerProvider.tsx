@@ -221,21 +221,53 @@ export function PlayerProvider({
     video.style.setProperty('--subtitle-background', background);
     video.style.setProperty('--subtitle-font-size', fontSize);
 
-    const placeActiveCues = () => {
-      for (const track of Array.from(video.textTracks)) {
-        for (const rawCue of Array.from(track.activeCues || [])) {
-          const cue = rawCue as VTTCue;
-          cue.snapToLines = false;
-          cue.line = cueLine;
-          cue.lineAlign = 'center';
-          cue.position = 50;
-          cue.positionAlign = 'center';
-        }
+    const placeCue = (cue: VTTCue) => {
+      cue.snapToLines = false;
+      cue.line = cueLine;
+      cue.lineAlign = 'center';
+      cue.position = 50;
+      cue.positionAlign = 'center';
+    };
+    const placeTrackCues = (track: TextTrack) => {
+      for (const rawCue of Array.from(track.cues || [])) {
+        placeCue(rawCue as VTTCue);
       }
     };
-    placeActiveCues();
-    video.addEventListener('timeupdate', placeActiveCues);
-    return () => video.removeEventListener('timeupdate', placeActiveCues);
+    const placeKnownCues = () => {
+      for (const track of Array.from(video.textTracks)) {
+        placeTrackCues(track);
+      }
+    };
+    const cleanupTrackListeners: Array<() => void> = [];
+    const listenToTrack = (track: TextTrack) => {
+      const handleCueChange = () => placeTrackCues(track);
+      placeTrackCues(track);
+      // A cuechange is dispatched as a subtitle becomes active.  This keeps
+      // its coordinates in place before the browser paints it, unlike the
+      // old timeupdate handler which visibly moved an already shown cue.
+      track.addEventListener('cuechange', handleCueChange);
+      cleanupTrackListeners.push(() =>
+        track.removeEventListener('cuechange', handleCueChange)
+      );
+    };
+    const handleAddTrack = (event: TrackEvent) => {
+      if (event.track) {
+        listenToTrack(event.track);
+      }
+    };
+
+    for (const track of Array.from(video.textTracks)) {
+      listenToTrack(track);
+    }
+    placeKnownCues();
+    video.textTracks.addEventListener('addtrack', handleAddTrack);
+    video.addEventListener('loadedmetadata', placeKnownCues);
+
+    return () => {
+      video.textTracks.removeEventListener('addtrack', handleAddTrack);
+      video.removeEventListener('loadedmetadata', placeKnownCues);
+      cleanupTrackListeners.forEach((cleanup) => cleanup());
+    };
   }, [subtitleAppearance]);
 
   const changeVolumeRelative = useCallback(
