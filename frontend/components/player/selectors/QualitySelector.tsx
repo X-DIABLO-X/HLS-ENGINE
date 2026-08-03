@@ -2,6 +2,21 @@
 
 import { usePlayer } from '../PlayerProvider';
 
+const qualityPresets = [
+  { width: 3840, label: '2160p' },
+  { width: 1920, label: '1080p' },
+  { width: 1280, label: '720p' },
+  { width: 854, label: '480p' },
+  { width: 640, label: '360p' },
+  { width: 426, label: '240p' },
+  { width: 256, label: '144p' },
+];
+
+function qualityLabel(width: number, height: number): string {
+  const preset = qualityPresets.find((item) => Math.abs(item.width - width) <= 2);
+  return preset ? `${preset.label} (${width}×${height})` : `${height}p (${width}×${height})`;
+}
+
 export function QualitySelector() {
   const { levels, currentLevel, activeLevel, setLevel } = usePlayer();
 
@@ -20,7 +35,7 @@ export function QualitySelector() {
         <span>Auto</span>
         {activeLevel >= 0 && levels[activeLevel] && (
           <span className="text-xs tabular-nums text-white/50">
-            Playing {levels[activeLevel].height}p
+            Playing {qualityLabel(levels[activeLevel].width, levels[activeLevel].height)}
           </span>
         )}
       </button>
@@ -34,7 +49,7 @@ export function QualitySelector() {
           }`}
           aria-pressed={currentLevel === index}
         >
-          <span>{level.height}p</span>
+          <span>{qualityLabel(level.width, level.height)}</span>
           <span className="flex items-center gap-2 text-xs tabular-nums text-white/50">
             {activeLevel === index && currentLevel !== -1 && (
               <span className="rounded bg-white/10 px-1.5 py-0.5 text-[10px] font-medium uppercase tracking-wide text-white/75">

@@ -1,6 +1,7 @@
 import { useEffect, useRef, useState } from 'react';
 import Hls, { Level, MediaPlaylist } from 'hls.js';
 import { AudioTrack, Rendition, Subtitle } from '@/types/video';
+import { displayLanguage } from '../language';
 
 export interface UseHlsOptions {
   manifestUrl: string;
@@ -38,10 +39,11 @@ function mapRenditions(hlsLevels: Level[]): Rendition[] {
 }
 
 function mapAudioTracks(tracks: MediaPlaylist[]): AudioTrack[] {
+  const seen = new Map<string, number>();
   return tracks.map((track, index) => ({
     id: `audio-${index}`,
     lang: track.lang || 'und',
-    name: track.name || `Track ${index + 1}`,
+    name: numberedLanguageName(track.lang, seen),
     default: track.default,
     autoselect: track.autoselect,
     forced: track.forced,
@@ -49,13 +51,25 @@ function mapAudioTracks(tracks: MediaPlaylist[]): AudioTrack[] {
 }
 
 function mapSubtitles(tracks: MediaPlaylist[]): Subtitle[] {
+  const seen = new Map<string, number>();
   return tracks.map((track, index) => ({
     id: `subtitle-${index}`,
     lang: track.lang || 'und',
-    name: track.name || `Subtitle ${index + 1}`,
+    name: numberedLanguageName(track.lang, seen),
     default: track.default,
     forced: track.forced,
   }));
+}
+
+function numberedLanguageName(
+  language: string | undefined,
+  seen: Map<string, number>
+): string {
+  const key = (language || 'und').toLowerCase();
+  const number = (seen.get(key) || 0) + 1;
+  seen.set(key, number);
+  const base = displayLanguage(language);
+  return number === 1 ? base : `${base} ${number}`;
 }
 
 function isSubtitleError(data: { details?: unknown; frag?: { type?: unknown } }): boolean {

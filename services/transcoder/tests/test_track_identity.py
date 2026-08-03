@@ -26,7 +26,7 @@ class TrackIdentityTests(unittest.TestCase):
         )
         self.assertEqual(
             [track["name"] for track in prepared],
-            ["IND", "IND 2", "ENG"],
+            ["Indonesian", "Indonesian 2", "English"],
         )
         self.assertEqual(
             [track["language"] for track in prepared],
@@ -34,7 +34,7 @@ class TrackIdentityTests(unittest.TestCase):
         )
         self.assertNotIn("track_id", tracks[0])
 
-    def test_metadata_titles_are_preferred_and_made_group_unique(self):
+    def test_metadata_titles_are_not_exposed_as_track_labels(self):
         tracks = [
             {
                 "language": "ind",
@@ -50,8 +50,8 @@ class TrackIdentityTests(unittest.TestCase):
 
         prepared = models.assign_track_identities(tracks, "audio_index")
 
-        self.assertEqual(prepared[0]["name"], "Main 'mix'")
-        self.assertEqual(prepared[1]["name"], "Main 'mix' 2")
+        self.assertEqual(prepared[0]["name"], "Indonesian")
+        self.assertEqual(prepared[1]["name"], "Indonesian 2")
 
     def test_direct_task_fallback_is_path_safe_and_stream_specific(self):
         self.assertEqual(
@@ -76,7 +76,7 @@ class TrackIdentityTests(unittest.TestCase):
 
         self.assertEqual(prepared[0]["language"], "und")
         self.assertEqual(prepared[0]["track_id"], "und")
-        self.assertEqual(prepared[0]["name"], "UND")
+        self.assertEqual(prepared[0]["name"], "Unknown language")
 
     def test_track_identity_can_be_recovered_for_package_fallback(self):
         track = SimpleNamespace(

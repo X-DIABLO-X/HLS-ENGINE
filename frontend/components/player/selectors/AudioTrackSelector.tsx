@@ -19,8 +19,7 @@ export function AudioTrackSelector() {
           }`}
           aria-pressed={currentAudioTrack === index}
         >
-          {track.name}{' '}
-          <span className="text-white/50">({track.lang.toUpperCase()})</span>
+          {track.name}
         </button>
       ))}
     </div>
