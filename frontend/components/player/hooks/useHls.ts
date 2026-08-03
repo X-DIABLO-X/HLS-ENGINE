@@ -15,7 +15,10 @@ export interface UseHlsReturn {
   levels: Rendition[];
   audioTracks: AudioTrack[];
   subtitles: Subtitle[];
+  /** User's quality choice: -1 means adaptive (Auto). */
   currentLevel: number;
+  /** Rendition hls.js is actually decoding right now. */
+  activeLevel: number;
   currentAudioTrack: number;
   currentSubtitleTrack: number;
   setLevel: (level: number) => void;
@@ -85,7 +88,11 @@ export function useHls(options: UseHlsOptions): UseHlsReturn {
   const [levels, setLevels] = useState<Rendition[]>([]);
   const [audioTracks, setAudioTracks] = useState<AudioTrack[]>([]);
   const [subtitles, setSubtitles] = useState<Subtitle[]>([]);
+  // Keep the selected quality distinct from the rendition being decoded.
+  // In adaptive mode hls.js emits LEVEL_SWITCHED whenever it changes bitrate;
+  // using that event to set currentLevel made Auto look like a manual choice.
   const [currentLevel, setCurrentLevel] = useState(-1);
+  const [activeLevel, setActiveLevel] = useState(-1);
   const [currentAudioTrack, setCurrentAudioTrack] = useState(-1);
   const [currentSubtitleTrack, setCurrentSubtitleTrack] = useState(-1);
 
@@ -114,7 +121,8 @@ export function useHls(options: UseHlsOptions): UseHlsReturn {
 
       hls.on(Hls.Events.MANIFEST_PARSED, (_event, data) => {
         setLevels(mapRenditions(data.levels));
-        setCurrentLevel(hls.nextLevel === -1 ? -1 : hls.nextLevel);
+        setCurrentLevel(-1);
+        setActiveLevel(hls.currentLevel);
         setAudioTracks(mapAudioTracks(hls.audioTracks));
         setCurrentAudioTrack(hls.audioTrack);
         setSubtitles(mapSubtitles(hls.subtitleTracks));
@@ -143,7 +151,7 @@ export function useHls(options: UseHlsOptions): UseHlsReturn {
       });
 
       hls.on(Hls.Events.LEVEL_SWITCHED, (_event, data) => {
-        setCurrentLevel(data.level);
+        setActiveLevel(data.level);
       });
 
       hls.on(Hls.Events.AUDIO_TRACK_SWITCHED, (_event, data) => {
@@ -242,6 +250,7 @@ export function useHls(options: UseHlsOptions): UseHlsReturn {
     audioTracks,
     subtitles,
     currentLevel,
+    activeLevel,
     currentAudioTrack,
     currentSubtitleTrack,
     setLevel,

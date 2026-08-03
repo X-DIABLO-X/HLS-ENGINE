@@ -8,17 +8,14 @@ export function AudioTrackSelector() {
   if (audioTracks.length <= 1) return null;
 
   return (
-    <div className="flex flex-col gap-1">
-      <span className="px-3 py-1 text-xs font-medium uppercase tracking-wide text-white/60">
-        Audio
-      </span>
+    <div className="flex flex-col gap-1 p-1">
       {audioTracks.map((track, index) => (
         <button
           key={track.id}
           type="button"
           onClick={() => setAudioTrack(index)}
-          className={`px-3 py-2 text-left text-sm transition-colors hover:bg-white/10 ${
-            currentAudioTrack === index ? 'text-accent' : 'text-white'
+          className={`rounded-md px-3 py-2.5 text-left text-sm transition-colors hover:bg-white/10 ${
+            currentAudioTrack === index ? 'bg-accent/10 text-accent' : 'text-white'
           }`}
           aria-pressed={currentAudioTrack === index}
         >

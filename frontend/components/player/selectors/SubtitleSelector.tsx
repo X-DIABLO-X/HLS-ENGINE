@@ -8,15 +8,12 @@ export function SubtitleSelector() {
   if (subtitles.length === 0) return null;
 
   return (
-    <div className="flex flex-col gap-1">
-      <span className="px-3 py-1 text-xs font-medium uppercase tracking-wide text-white/60">
-        Subtitles
-      </span>
+    <div className="flex flex-col gap-1 p-1">
       <button
         type="button"
         onClick={() => setSubtitleTrack(-1)}
-        className={`px-3 py-2 text-left text-sm transition-colors hover:bg-white/10 ${
-          currentSubtitleTrack === -1 ? 'text-accent' : 'text-white'
+        className={`rounded-md px-3 py-2.5 text-left text-sm transition-colors hover:bg-white/10 ${
+          currentSubtitleTrack === -1 ? 'bg-accent/10 text-accent' : 'text-white'
         }`}
         aria-pressed={currentSubtitleTrack === -1}
       >
@@ -27,8 +24,8 @@ export function SubtitleSelector() {
           key={track.id}
           type="button"
           onClick={() => setSubtitleTrack(index)}
-          className={`px-3 py-2 text-left text-sm transition-colors hover:bg-white/10 ${
-            currentSubtitleTrack === index ? 'text-accent' : 'text-white'
+          className={`rounded-md px-3 py-2.5 text-left text-sm transition-colors hover:bg-white/10 ${
+            currentSubtitleTrack === index ? 'bg-accent/10 text-accent' : 'text-white'
           }`}
           aria-pressed={currentSubtitleTrack === index}
         >
