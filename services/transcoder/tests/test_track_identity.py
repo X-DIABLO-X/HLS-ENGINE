@@ -191,8 +191,13 @@ class MasterPlaylistTrackTests(unittest.TestCase):
         self.assertIn(
             'URI="subtitles_ind_2/subtitles.m3u8"', master
         )
+        self.assertIn(
+            'TYPE=SUBTITLES,GROUP-ID="subs",NAME="English",DEFAULT=YES,'
+            'AUTOSELECT=YES,LANGUAGE="eng"',
+            master,
+        )
         self.assertIn('CODECS="avc1.640028,mp4a.40.2"', master)
-        self.assertEqual(master.count("DEFAULT=YES"), 1)
+        self.assertEqual(master.count("DEFAULT=YES"), 2)
 
     def test_master_uniquifies_duplicate_persisted_names(self):
         with tempfile.TemporaryDirectory() as output_dir:

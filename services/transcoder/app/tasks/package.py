@@ -254,6 +254,18 @@ def _write_master(
 
     if subtitles:
         subtitle_names = _media_names(subtitles)
+        # Prefer an English subtitle for automatic playback.  It is the most
+        # broadly useful default for mixed-language releases; if absent, make
+        # the first source subtitle available rather than leaving all tracks
+        # disabled by default.
+        default_idx = next(
+            (
+                idx
+                for idx, track in enumerate(subtitles)
+                if models.normalize_track_language(track.language) == "eng"
+            ),
+            0,
+        )
         for idx, track in enumerate(subtitles):
             lang = models.normalize_track_language(track.language)
             name = subtitle_names[idx]
@@ -262,7 +274,8 @@ def _write_master(
             )
             lines.append(
                 f'#EXT-X-MEDIA:TYPE=SUBTITLES,GROUP-ID="subs",NAME="{name}",'
-                f'DEFAULT=NO,AUTOSELECT=YES,LANGUAGE="{lang}",URI="{uri}"'
+                f'DEFAULT={"YES" if idx == default_idx else "NO"},AUTOSELECT=YES,'
+                f'LANGUAGE="{lang}",URI="{uri}"'
             )
 
     for rendition in renditions:

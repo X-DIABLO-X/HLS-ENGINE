@@ -139,7 +139,17 @@ export function useHls(options: UseHlsOptions): UseHlsReturn {
         setActiveLevel(hls.currentLevel);
         setAudioTracks(mapAudioTracks(hls.audioTracks));
         setCurrentAudioTrack(hls.audioTrack);
-        setSubtitles(mapSubtitles(hls.subtitleTracks));
+        const subtitleTracks = hls.subtitleTracks;
+        const defaultSubtitleTrack = subtitleTracks.findIndex(
+          (track) => track.default
+        );
+        // hls.js leaves subtitles off unless instructed otherwise on some
+        // browsers. Honour the manifest's DEFAULT=YES selection explicitly.
+        if (defaultSubtitleTrack >= 0) {
+          hls.subtitleTrack = defaultSubtitleTrack;
+          setCurrentSubtitleTrack(defaultSubtitleTrack);
+        }
+        setSubtitles(mapSubtitles(subtitleTracks));
         setIsLoading(false);
         onReadyRef.current?.();
       });

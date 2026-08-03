@@ -1,5 +1,6 @@
 'use client';
 
+import { Redo2, Undo2 } from 'lucide-react';
 import { usePlayer } from '../PlayerProvider';
 
 interface SkipButtonProps {
@@ -15,12 +16,18 @@ export function SkipButton({ direction }: SkipButtonProps) {
     <button
       type="button"
       onClick={() => seekRelative(isBackward ? -10 : 10)}
-      className="flex h-9 min-w-11 items-center justify-center rounded-md px-1.5 text-xs font-semibold tabular-nums text-white transition-colors hover:bg-white/10 focus-visible:ring-2 focus-visible:ring-white"
+      className="relative flex h-10 w-11 items-center justify-center rounded-md text-white transition-colors hover:bg-white/10 focus-visible:ring-2 focus-visible:ring-white"
       aria-label={label}
       title={label}
     >
-      {isBackward ? '−10' : '+10'}
-      <span className="ml-0.5 text-[10px] font-medium text-white/60">s</span>
+      {isBackward ? (
+        <Undo2 aria-hidden="true" className="h-6 w-6 -translate-y-0.5" strokeWidth={2.35} />
+      ) : (
+        <Redo2 aria-hidden="true" className="h-6 w-6 -translate-y-0.5" strokeWidth={2.35} />
+      )}
+      <span className="pointer-events-none absolute bottom-0.5 text-[10px] font-bold leading-none tabular-nums">
+        10
+      </span>
     </button>
   );
 }
