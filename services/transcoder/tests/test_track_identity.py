@@ -2,6 +2,7 @@ import os
 import tempfile
 import unittest
 from types import SimpleNamespace
+from unittest.mock import patch
 
 from app import models
 from app.tasks.package import _rel_path, _write_master
@@ -162,9 +163,21 @@ class MasterPlaylistTrackTests(unittest.TestCase):
             ]
             master_path = os.path.join(output_dir, "master.m3u8")
 
-            _write_master(
-                master_path, output_dir, renditions, audio, subtitles
-            )
+            with patch(
+                "app.tasks.package.ffmpeg_utils.ffprobe",
+                return_value={
+                    "streams": [
+                        {
+                            "codec_type": "video",
+                            "width": 1280,
+                            "height": 720,
+                        }
+                    ]
+                },
+            ):
+                _write_master(
+                    master_path, output_dir, renditions, audio, subtitles
+                )
 
             with open(master_path, encoding="utf-8") as handle:
                 master = handle.read()

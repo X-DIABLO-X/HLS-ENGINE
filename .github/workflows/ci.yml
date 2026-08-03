@@ -75,6 +75,16 @@ jobs:
     name: Transcoder / compile and unit tests
     runs-on: ubuntu-latest
     timeout-minutes: 25
+    services:
+      redis:
+        image: redis:7-alpine
+        ports:
+          - 6379:6379
+        options: >-
+          --health-cmd "redis-cli ping"
+          --health-interval 1s
+          --health-timeout 5s
+          --health-retries 20
     env:
       TRANSCODER_CI_IMAGE: hls-engine-transcoder-ci:${{ github.sha }}
     steps:
@@ -107,6 +117,18 @@ jobs:
           "$TRANSCODER_CI_IMAGE"
           python -m unittest discover --start-directory tests --top-level-directory . --verbose
 
+      - name: Run real Redis progress integration
+        run: >-
+          docker run --rm
+          --network host
+          --volume "$GITHUB_WORKSPACE:/workspace:ro"
+          --workdir /workspace/services/transcoder
+          --env PYTHONPATH=/app
+          --env PYTHONPYCACHEPREFIX=/tmp/pycache
+          --env HLS_REDIS_INTEGRATION_URL=redis://127.0.0.1:6379/15
+          "$TRANSCODER_CI_IMAGE"
+          python -m unittest --verbose tests.test_progress_redis_integration
+
       - name: Test end-to-end safety helpers
         run: >-
           docker run --rm
@@ -116,6 +138,42 @@ jobs:
           --env PYTHONPYCACHEPREFIX=/tmp/pycache
           "$TRANSCODER_CI_IMAGE"
           python -m unittest --verbose scripts.test_e2e_pipeline
+
+      - name: Test acceleration benchmark safety helpers
+        run: >-
+          docker run --rm
+          --volume "$GITHUB_WORKSPACE:/workspace:ro"
+          --workdir /workspace
+          --env PYTHONPATH=/app
+          --env PYTHONPYCACHEPREFIX=/tmp/pycache
+          "$TRANSCODER_CI_IMAGE"
+          python -m unittest --verbose scripts.test_benchmark_hls_acceleration
+
+  transcoder-gpu-image:
+    name: Transcoder / accelerated image
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    env:
+      TRANSCODER_GPU_CI_IMAGE: hls-engine-transcoder-gpu-ci:${{ github.sha }}
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+
+      - name: Build checksum-pinned FFmpeg/NVENC image
+        run: >-
+          docker build
+          --file services/transcoder/Dockerfile.gpu
+          --build-arg FFMPEG_BUILD_JOBS=2
+          --tag "$TRANSCODER_GPU_CI_IMAGE"
+          services/transcoder
+
+      - name: Verify accelerated runtime capabilities
+        run: |
+          docker run --rm --entrypoint ffmpeg "$TRANSCODER_GPU_CI_IMAGE" -hide_banner -version
+          docker run --rm --entrypoint ffmpeg "$TRANSCODER_GPU_CI_IMAGE" -hide_banner -encoders 2>&1 | grep -q h264_nvenc
+          docker run --rm --entrypoint ffmpeg "$TRANSCODER_GPU_CI_IMAGE" -hide_banner -filters 2>&1 | grep -q scale_cuda
 
   frontend:
     name: Frontend / audit and build
@@ -145,6 +203,9 @@ jobs:
       - name: Audit dependencies
         run: npm audit --audit-level=high
 
+      - name: Test
+        run: npm test
+
       - name: Lint
         run: npm run lint
 
@@ -171,6 +232,8 @@ jobs:
         run: docker compose --env-file .env.example --profile gpu -f docker-compose.yml config --quiet
 
       - name: Validate production overrides
+        env:
+          NEXT_PUBLIC_HLS_BASE_URL: https://media.example.test/hls
         run: >-
           docker compose
           --env-file .env.example
@@ -179,6 +242,8 @@ jobs:
           config --quiet
 
       - name: Validate production GPU overrides
+        env:
+          NEXT_PUBLIC_HLS_BASE_URL: https://media.example.test/hls
         run: >-
           docker compose
           --env-file .env.example

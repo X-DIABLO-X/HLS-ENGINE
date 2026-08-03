@@ -1,9 +1,9 @@
 """Pydantic settings loaded from environment variables."""
 
 from functools import lru_cache
-from typing import Literal
+from typing import Literal, Optional
 
-from pydantic import Field, model_validator
+from pydantic import Field, field_validator, model_validator
 from pydantic_settings import BaseSettings
 
 
@@ -48,13 +48,22 @@ class Settings(BaseSettings):
     GPU_INDEX: int = 0
     NVIDIA_VISIBLE_DEVICES: str = "all"
     GPU_REGISTRY_ENABLED: bool = True
-    NVENC_MAX_SESSIONS: int = 3
+    # A dual-rendition H.264 command consumes two encoder sessions. Keeping
+    # the conservative default at two prevents accidental oversubscription on
+    # laptop/consumer GPUs; operators can raise it after measuring their card.
+    NVENC_MAX_SESSIONS: int = 2
+    # Opt-in only: None preserves the audited legacy NVENC command exactly.
+    NVENC_PROFILE: Optional[
+        Literal["quality", "balanced", "turbo"]
+    ] = None
     GPU_WORKER_ID: str = ""  # auto from hostname if empty
     HLS_SEGMENT_FORMAT: str = "fmp4"  # fmp4|ts
     VIDEO_CODEC: str = "h264"  # h264|hevc|av1
-    # Single-pass is the audited safe default. Chunking stays available as an
-    # explicit opt-in until retry fencing prevents stale chunks from overwriting
-    # a newer attempt's output.
+    # Opt-in only: direct H.264 remux bypasses the encoded ABR ladder.
+    VIDEO_PASSTHROUGH_ENABLED: bool = False
+    # Chunking is retry/generation fenced but remains opt-in because temporal
+    # concurrency only helps when the measured encoder has spare session
+    # throughput. A saturated NVENC block can make extra chunks slower.
     CHUNKED_ENCODING: bool = False
     # When explicitly enabled, long-media tasks are split into at most five
     # minutes of source media. The pipeline may raise the 60-second base toward
@@ -88,6 +97,8 @@ class Settings(BaseSettings):
     FFMPEG_TASK_RUNTIME_MARGIN_SEC: int = Field(default=900, ge=60)
     PER_TITLE_ENCODING: bool = True
     LOUDNORM: bool = True
+    # Opt-in: stream-copying preserves the source AAC bitrate and packet data.
+    AAC_PASSTHROUGH_ENABLED: bool = False
     TRICKPLAY: bool = True
     TRANSCODER_METRICS_ENABLED: bool = True
 
@@ -113,6 +124,13 @@ class Settings(BaseSettings):
     WORKSPACE_CLEANUP_MAX_RETRIES: int = Field(default=360, ge=0)
     WORKSPACE_REAPER_INTERVAL_SEC: float = Field(default=60.0, ge=10.0)
     WORKSPACE_REAPER_SCAN_LIMIT: int = Field(default=1000, ge=1, le=10_000)
+
+    @field_validator("NVENC_PROFILE", mode="before")
+    @classmethod
+    def blank_nvenc_profile_is_unset(cls, value):
+        if isinstance(value, str) and not value.strip():
+            return None
+        return value
 
     @model_validator(mode="after")
     def validate_task_time_limits(self):

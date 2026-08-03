@@ -31,6 +31,51 @@ class FFmpegError(Exception):
     pass
 
 
+def is_nvdec_initialization_failure(error: Any) -> bool:
+    """Return whether FFmpeg failed while initializing CUDA video decode.
+
+    The classifier is intentionally narrower than a generic CUDA or
+    out-of-memory check. NVENC and GPU filters can report the same CUDA error,
+    but software decode plus ``hwupload_cuda`` only bypasses failures in the
+    NVDEC/CUVID input path.
+    """
+    text = str(error or "")
+    if isinstance(error, BaseException):
+        for attr in ("stderr", "output"):
+            value = getattr(error, attr, None)
+            if value:
+                text += f"\n{value}"
+    normalized = " ".join(text.lower().split())
+
+    if (
+        "cannot load libnvcuvid" in normalized
+        or "failed loading nvcuvid" in normalized
+    ):
+        return True
+
+    # Keep the decoder-creation evidence and failure marker on the same log
+    # line. A broad multi-line CUDA match could incorrectly retry an NVENC or
+    # GPU-filter failure that software decoding cannot bypass.
+    for line in text.splitlines():
+        normalized_line = " ".join(line.lower().split())
+        marker = "cuvidcreatedecoder"
+        marker_index = normalized_line.find(marker)
+        if marker_index < 0:
+            continue
+        failure_index = normalized_line.find(
+            " failed",
+            marker_index + len(marker),
+        )
+        if failure_index < 0:
+            continue
+        call_context = normalized_line[
+            marker_index + len(marker):failure_index
+        ]
+        if ";" not in call_context and "succeeded" not in call_context:
+            return True
+    return False
+
+
 # ----------------------------------------------------------------------------
 # Command runners
 # ----------------------------------------------------------------------------
@@ -782,6 +827,25 @@ def ffprobe(path: str) -> Dict[str, Any]:
     return json.loads(run_cmd(cmd).stdout)
 
 
+def ffprobe_video_packets(path: str) -> List[Dict[str, Any]]:
+    """Return the minimal packet timeline needed to validate a copied HLS."""
+    cmd = [
+        "ffprobe",
+        "-v",
+        "error",
+        "-select_streams",
+        "v:0",
+        "-show_entries",
+        "packet=pts_time,dts_time,duration_time,flags",
+        "-of",
+        "json",
+        path,
+    ]
+    payload = json.loads(run_cmd(cmd).stdout)
+    packets = payload.get("packets", [])
+    return packets if isinstance(packets, list) else []
+
+
 # ----------------------------------------------------------------------------
 # GPU / encoder detection
 # ----------------------------------------------------------------------------
@@ -931,6 +995,19 @@ def _gpu_encoder(codec: str) -> str:
     return "libx264"  # caller should treat non-nvenc as CPU
 
 
+def _required_gpu_encoder(codec: str) -> str:
+    """Resolve an exact NVENC encoder without launching a test encode."""
+    normalized = (codec or "h264").lower()
+    enc = _GPU_CODEC_ENCODERS.get(normalized)
+    if enc is None:
+        raise FFmpegError(f"unsupported GPU codec {codec}")
+    if enc not in _ffmpeg_encoders():
+        raise FFmpegError(
+            f"required NVENC encoder is unavailable for codec {codec}"
+        )
+    return enc
+
+
 def _cpu_encoder(codec: str) -> str:
     """Map a codec to a CPU encoder, falling back to libx264."""
     encoders = _ffmpeg_encoders()
@@ -955,6 +1032,14 @@ def select_hwaccel_args(gpu_index: Optional[int], use_gpu: bool) -> List[str]:
     if _gpu_scaler() is not None:
         args += ["-hwaccel_output_format", "cuda"]
     return args
+
+
+def _cuda_filter_device_args(gpu_index: Optional[int]) -> List[str]:
+    """Initialize CUDA for filters while leaving input decoding on the CPU."""
+    device = "cuda=gpu"
+    if gpu_index is not None:
+        device += f":{int(gpu_index)}"
+    return ["-init_hw_device", device, "-filter_hw_device", "gpu"]
 
 
 def nvenc_max_sessions() -> int:
@@ -993,30 +1078,40 @@ def width_for_height(src_w: int, src_h: int, target_h: int) -> int:
 
 
 QUALITY_LADDER = {
-    2160: {"bitrate": 14_000_000, "label": "4K"},
-    1080: {"bitrate": 6_000_000, "label": "Full HD"},
-    720:  {"bitrate": 3_000_000, "label": "HD"},
-    480:  {"bitrate": 1_500_000, "label": "SD"},
-    360:  {"bitrate": 800_000,   "label": "Low"},
-    240:  {"bitrate": 400_000,   "label": "Very Low"},
-    144:  {"bitrate": 200_000,   "label": "Minimal"},
+    # Width is a bounding-box ceiling, not a forced display aspect ratio.
+    # This prevents cinematic sources from turning a nominal 720p rung into
+    # 1720x720 (and a 480p rung into 1146x480), which wastes encoder work and
+    # bandwidth. ``force_original_aspect_ratio=decrease`` keeps the picture
+    # undistorted inside these standard HLS boxes.
+    2160: {"width": 3840, "bitrate": 14_000_000, "label": "4K"},
+    1080: {"width": 1920, "bitrate": 6_000_000, "label": "Full HD"},
+    720:  {"width": 1280, "bitrate": 3_000_000, "label": "HD"},
+    480:  {"width": 854,  "bitrate": 1_500_000, "label": "SD"},
+    360:  {"width": 640,  "bitrate": 800_000,   "label": "Low"},
+    240:  {"width": 426,  "bitrate": 400_000,   "label": "Very Low"},
+    144:  {"width": 256,  "bitrate": 200_000,   "label": "Minimal"},
 }
 
 
 def get_ladder(source_height: int, source_width: int) -> List[Dict[str, int]]:
     """Return a default bitrate ladder up to the source resolution."""
     ladder = [
-        {"height": 2160, "bitrate": 14_000_000},
-        {"height": 1080, "bitrate": 6_000_000},
-        {"height": 720,  "bitrate": 3_000_000},
-        {"height": 480,  "bitrate": 1_500_000},
-        {"height": 360,  "bitrate": 800_000},
+        {
+            "height": height,
+            "width": entry["width"],
+            "bitrate": entry["bitrate"],
+        }
+        for height, entry in QUALITY_LADDER.items()
+        if height >= 360
     ]
     selected = [r for r in ladder if r["height"] <= source_height]
     if not selected:
         selected = [ladder[-1]]
     for rung in selected:
-        rung["width"] = width_for_height(source_width, source_height, rung["height"])
+        rung["width"] = min(
+            int(rung["width"]),
+            width_for_height(source_width, source_height, rung["height"]),
+        )
     return selected
 
 
@@ -1030,19 +1125,38 @@ def get_ladder_for_qualities(
     for q in sorted(qualities, reverse=True):
         if q > source_height:
             continue
-        entry = QUALITY_LADDER.get(q, {"bitrate": 800_000})
+        entry = QUALITY_LADDER.get(
+            q,
+            {
+                "width": width_for_height(source_width, source_height, q),
+                "bitrate": 800_000,
+            },
+        )
         rung = {
             "height": q,
             "bitrate": entry["bitrate"],
-            "width": width_for_height(source_width, source_height, q),
+            "width": min(
+                int(entry["width"]),
+                width_for_height(source_width, source_height, q),
+            ),
         }
         selected.append(rung)
     if not selected:
         q = min(qualities) if qualities else 360
+        entry = QUALITY_LADDER.get(
+            q,
+            {
+                "width": width_for_height(source_width, source_height, q),
+                "bitrate": 800_000,
+            },
+        )
         rung = {
             "height": q,
-            "bitrate": QUALITY_LADDER.get(q, {"bitrate": 800_000})["bitrate"],
-            "width": width_for_height(source_width, source_height, q),
+            "bitrate": entry["bitrate"],
+            "width": min(
+                int(entry["width"]),
+                width_for_height(source_width, source_height, q),
+            ),
         }
         selected.append(rung)
     return selected
@@ -1174,6 +1288,54 @@ def _level_label(codec: str, height: int) -> str:
     return "3.0"
 
 
+_DIRECT_H264_PROFILE_PREFIX = "direct-h264:"
+_H264_RFC6381_PROFILE_BYTES = {
+    "baseline": "4200",
+    "constrained baseline": "42e0",
+    "main": "4d00",
+    "high": "6400",
+}
+
+
+def direct_h264_profile_metadata(profile: Any, level: Any) -> str:
+    """Serialize direct-play H.264 profile/level into the existing DB field.
+
+    Encoded renditions continue to persist their historical ``"high"`` value.
+    The namespaced value is only used for direct stream-copy renditions, where
+    packaging must advertise the source bitstream instead of inferring a level
+    from output height.
+    """
+    normalized_profile = str(profile or "").strip().lower()
+    if normalized_profile not in _H264_RFC6381_PROFILE_BYTES:
+        raise ValueError("unsupported direct-play H.264 profile")
+    try:
+        normalized_level = int(level)
+    except (TypeError, ValueError) as exc:
+        raise ValueError("invalid direct-play H.264 level") from exc
+    if not 10 <= normalized_level <= 52:
+        raise ValueError("unsupported direct-play H.264 level")
+    return (
+        f"{_DIRECT_H264_PROFILE_PREFIX}"
+        f"{normalized_profile}:{normalized_level}"
+    )
+
+
+def _direct_h264_codecs_string(profile_metadata: Any) -> Optional[str]:
+    value = str(profile_metadata or "").strip().lower()
+    if not value.startswith(_DIRECT_H264_PROFILE_PREFIX):
+        return None
+    payload = value[len(_DIRECT_H264_PROFILE_PREFIX):]
+    try:
+        profile, raw_level = payload.rsplit(":", 1)
+        level = int(raw_level)
+        profile_bytes = _H264_RFC6381_PROFILE_BYTES[profile]
+    except (KeyError, TypeError, ValueError) as exc:
+        raise ValueError("invalid persisted direct-play H.264 metadata") from exc
+    if not 10 <= level <= 52:
+        raise ValueError("unsupported persisted direct-play H.264 level")
+    return f"avc1.{profile_bytes}{level:02x}"
+
+
 def codecs_string(codec: str, height: int, profile: str = "high") -> str:
     """Return an HLS CODECS attribute string for a rendition."""
     h = int(height or 1080)
@@ -1182,6 +1344,9 @@ def codecs_string(codec: str, height: int, profile: str = "high") -> str:
         return "hvc1.1.6.L150.B0" if h >= 2160 else "hvc1.1.6.L120.B0"
     if c == "av1":
         return "av01.0.12M.08" if h >= 2160 else "av01.0.08M.08"
+    direct_codecs = _direct_h264_codecs_string(profile)
+    if direct_codecs is not None:
+        return direct_codecs
     # H.264 High profile (profile_idc=0x64, constraint=0x00).
     if h >= 2160:
         lvl = "33"   # 5.1
@@ -1259,6 +1424,48 @@ def audio_delay_ms(stream: Dict[str, Any], video_start: float = 0.0) -> float:
     return delay_sec * 1000.0
 
 
+def _video_rotation(stream: Dict[str, Any]) -> float:
+    """Return display rotation metadata in degrees, defaulting to zero."""
+    values = [(stream.get("tags", {}) or {}).get("rotate")]
+    values.extend(
+        side_data.get("rotation")
+        for side_data in (stream.get("side_data_list", []) or [])
+        if isinstance(side_data, dict)
+    )
+    for value in values:
+        if value is None:
+            continue
+        try:
+            return float(value)
+        except (TypeError, ValueError):
+            return float("nan")
+    return 0.0
+
+
+def _stream_duration(stream: Dict[str, Any]) -> float:
+    """Return a positive stream duration, including Matroska DURATION tags."""
+    try:
+        duration = float(stream.get("duration", 0) or 0)
+    except (TypeError, ValueError):
+        duration = 0.0
+    if math.isfinite(duration) and duration > 0:
+        return duration
+
+    raw_tag = (stream.get("tags", {}) or {}).get("DURATION")
+    if raw_tag is None:
+        return 0.0
+    try:
+        hours, minutes, seconds = str(raw_tag).strip().split(":")
+        duration = (
+            float(hours) * 3600.0
+            + float(minutes) * 60.0
+            + float(seconds)
+        )
+    except (TypeError, ValueError):
+        return 0.0
+    return duration if math.isfinite(duration) and duration > 0 else 0.0
+
+
 def parse_probe(probe: Dict[str, Any]) -> Dict[str, Any]:
     """Normalize ffprobe output into the metadata we need."""
     video = next(
@@ -1277,6 +1484,7 @@ def parse_probe(probe: Dict[str, Any]) -> Dict[str, Any]:
 
     fmt = probe.get("format", {})
     duration = float(fmt.get("duration", 0) or 0)
+    video_duration = _stream_duration(video) or duration
 
     def lang(stream: Dict[str, Any]) -> str:
         return (
@@ -1295,15 +1503,87 @@ def parse_probe(probe: Dict[str, Any]) -> Dict[str, Any]:
 
     return {
         "duration": duration,
+        "video_duration": video_duration,
         "width": int(video.get("width", 0) or 0),
         "height": int(video.get("height", 0) or 0),
         "video_codec": video.get("codec_name"),
+        "video_profile": video.get("profile"),
+        "video_level": video.get("level"),
+        "video_pix_fmt": video.get("pix_fmt"),
+        "video_field_order": video.get("field_order"),
+        "video_sample_aspect_ratio": video.get("sample_aspect_ratio"),
+        "video_rotation": _video_rotation(video),
         "video_bitrate": int(video.get("bit_rate", 0) or fmt.get("bit_rate", 0) or 0),
         "frame_rate": _frame_rate(video),
         "video_start_time": video_start,
         "audio_tracks": audio,
         "subtitle_tracks": subtitles,
     }
+
+
+_H264_DIRECT_PLAY_PROFILES = {
+    "baseline",
+    "constrained baseline",
+    "main",
+    "high",
+}
+
+
+def h264_direct_play_eligibility(
+    probe: Dict[str, Any],
+    requested_codec: str,
+) -> Tuple[bool, str]:
+    """Fail-closed H.264/HLS stream-copy compatibility decision."""
+    if str(requested_codec or "").strip().lower() != "h264":
+        return False, "requested output codec is not h264"
+    if str(probe.get("video_codec") or "").strip().lower() != "h264":
+        return False, "source video codec is not h264"
+    if str(probe.get("video_pix_fmt") or "").strip().lower() != "yuv420p":
+        return False, "source pixel format is not 8-bit yuv420p"
+    if (
+        str(probe.get("video_field_order") or "").strip().lower()
+        != "progressive"
+    ):
+        return False, "source is interlaced or field order is unknown"
+    if str(probe.get("video_sample_aspect_ratio") or "").strip() != "1:1":
+        return False, "source sample aspect ratio is missing or non-square"
+
+    profile = str(probe.get("video_profile") or "").strip().lower()
+    if profile not in _H264_DIRECT_PLAY_PROFILES:
+        return False, "source H.264 profile is missing or unsupported"
+
+    try:
+        width = int(probe.get("width"))
+        height = int(probe.get("height"))
+        frame_rate = float(probe.get("frame_rate"))
+        duration = float(probe.get("duration"))
+        bitrate = int(probe.get("video_bitrate"))
+        level = int(probe.get("video_level"))
+        rotation = float(probe.get("video_rotation"))
+    except (TypeError, ValueError):
+        return False, "required source compatibility metadata is missing"
+
+    if (
+        width < 16
+        or height < 16
+        or width > 4096
+        or height > 2160
+        or width * height > 4096 * 2160
+        or width % 2
+        or height % 2
+    ):
+        return False, "source dimensions are odd or outside safe bounds"
+    if not math.isfinite(frame_rate) or not 1.0 <= frame_rate <= 60.0:
+        return False, "source frame rate is outside safe bounds"
+    if not math.isfinite(rotation) or abs(rotation % 360.0) > 0.001:
+        return False, "source carries unsupported display rotation"
+    if not math.isfinite(duration) or duration <= 0:
+        return False, "source duration is missing or invalid"
+    if bitrate <= 0:
+        return False, "source video bitrate is missing or invalid"
+    if not 10 <= level <= 52:
+        return False, "source H.264 level is missing or unsupported"
+    return True, "eligible"
 
 
 def _gop_size(fps: float, seg_dur: int) -> int:
@@ -1317,7 +1597,13 @@ def _gop_size(fps: float, seg_dur: int) -> int:
 # ----------------------------------------------------------------------------
 
 
-def _scale_filter_for(use_gpu: bool, w: int, h: int, align_pts: bool = False) -> str:
+def _scale_filter_for(
+    use_gpu: bool,
+    w: int,
+    h: int,
+    align_pts: bool = False,
+    prefer_scale_cuda: bool = False,
+) -> str:
     """Return the scale filter chain for the active pipeline.
 
     When ``align_pts`` is True, prepend ``setpts=PTS-STARTPTS`` so the video
@@ -1327,10 +1613,18 @@ def _scale_filter_for(use_gpu: bool, w: int, h: int, align_pts: bool = False) ->
     """
     prefix = "setpts=PTS-STARTPTS," if align_pts else ""
     scaler = _gpu_scaler() if use_gpu else None
+    if prefer_scale_cuda and use_gpu and "scale_cuda" in _ffmpeg_filters():
+        scaler = "scale_cuda"
     if scaler == "scale_npp":
-        return f"{prefix}scale_npp={w}:{h}:force_original_aspect_ratio=decrease:format=yuv420p"
+        return (
+            f"{prefix}scale_npp={w}:{h}:force_original_aspect_ratio=decrease:"
+            "force_divisible_by=2:format=yuv420p"
+        )
     if scaler == "scale_cuda":
-        return f"{prefix}scale_cuda={w}:{h}:force_original_aspect_ratio=decrease"
+        return (
+            f"{prefix}scale_cuda={w}:{h}:force_original_aspect_ratio=decrease:"
+            "force_divisible_by=2"
+        )
     return (
         f"{prefix}scale={w}:{h}:flags=lanczos:force_original_aspect_ratio=decrease,"
         f"pad=ceil(iw/2)*2:ceil(ih/2)*2"
@@ -1349,21 +1643,102 @@ def _nvenc_preset(preset: str) -> str:
     return "p6"
 
 
+_NVENC_PROFILES: Dict[str, Dict[str, Any]] = {
+    "quality": {
+        "preset": "p6",
+        "multipass": "fullres",
+        "lookahead": 32,
+        "spatial_aq": True,
+    },
+    "balanced": {
+        "preset": "p4",
+        "multipass": "qres",
+        "lookahead": 12,
+        "spatial_aq": False,
+    },
+    "turbo": {
+        "preset": "p3",
+        "multipass": "disabled",
+        "lookahead": 0,
+        "spatial_aq": False,
+    },
+}
+_NVENC_PROFILE_FROM_ENV = object()
+
+
+def _configured_nvenc_profile(
+    profile: Any = _NVENC_PROFILE_FROM_ENV,
+) -> Optional[str]:
+    """Return a validated explicit NVENC profile, if any.
+
+    Pipeline tasks pass their immutable settings snapshot. The environment
+    lookup remains only for direct/legacy command-builder callers that omit the
+    argument entirely.
+    """
+    if profile is _NVENC_PROFILE_FROM_ENV:
+        try:
+            profile = getattr(get_settings(), "NVENC_PROFILE", None)
+        except Exception:
+            return None
+    normalized = str(profile or "").strip().lower()
+    return normalized if normalized in _NVENC_PROFILES else None
+
+
 def _nvenc_encode_args(
     enc: str, bitrate: int, gop: int, seg: int, preset: str,
     lookahead: bool, bf: int, aq: bool,
+    nvenc_profile: Any = _NVENC_PROFILE_FROM_ENV,
 ) -> List[str]:
     maxrate = int(bitrate * 1.5)
     bufsize = bitrate * 2
-    profile = "high" if enc == "h264_nvenc" else "main"
+    configured_profile = _configured_nvenc_profile(nvenc_profile)
+    tuning = (
+        _NVENC_PROFILES[configured_profile]
+        if configured_profile is not None
+        else None
+    )
+    effective_preset = (
+        str(tuning["preset"]) if tuning is not None else _nvenc_preset(preset)
+    )
+    codec_profile = "high" if enc == "h264_nvenc" else "main"
     args = [
-        "-preset", _nvenc_preset(preset), "-tune", "hq", "-profile:v", profile,
+        "-preset", effective_preset,
+        "-tune", "hq", "-profile:v", codec_profile,
         "-rc", "vbr", "-b:v", str(bitrate),
         "-maxrate", str(maxrate), "-bufsize", str(bufsize),
         "-g", str(gop), "-keyint_min", str(gop),
         "-sc_threshold", "0", "-flags", "+cgop",
         "-force_key_frames", f"expr:gte(t,n_forced*{seg})",
     ]
+    if tuning is not None:
+        cq = {
+            "h264_nvenc": "23",
+            "hevc_nvenc": "25",
+            "av1_nvenc": "28",
+        }.get(enc)
+        if cq is None:
+            return args
+        args += [
+            "-cq", cq,
+            "-multipass", str(tuning["multipass"]),
+        ]
+        if tuning["spatial_aq"]:
+            args += ["-spatial-aq", "1"]
+        # Balanced and turbo deliberately retain temporal AQ: it has a
+        # smaller throughput cost than spatial AQ and protects motion detail.
+        args += ["-temporal-aq", "1"]
+        if enc in {"h264_nvenc", "hevc_nvenc"} and bf:
+            args += ["-bf", str(bf)]
+            if configured_profile == "quality":
+                # Keep the current quality profile's legacy two-pass switch.
+                args += ["-2pass", "1"]
+        profile_lookahead = int(tuning["lookahead"])
+        args += ["-rc-lookahead", str(profile_lookahead)]
+        if profile_lookahead:
+            args += ["-no-scenecut", "1"]
+        return args
+
+    # No configured profile: preserve the legacy command construction exactly.
     if enc == "h264_nvenc":
         args += ["-cq", "23", "-multipass", "fullres"]
         if aq:
@@ -1450,6 +1825,63 @@ def _hls_mux_args(
     return args
 
 
+def remux_h264_hls_command(
+    input_path: str,
+    output_dir: str,
+    segment_duration: int = SEGMENT_DURATION,
+    segment_format: str = "fmp4",
+) -> List[str]:
+    """Stream-copy one H.264 source rendition into a complete VOD HLS."""
+    os.makedirs(output_dir, exist_ok=True)
+    seg = max(1, int(segment_duration))
+    fmt = (segment_format or "fmp4").strip().lower()
+    if fmt not in {"fmp4", "ts"}:
+        raise ValueError(f"unsupported HLS segment format: {segment_format}")
+    playlist = os.path.join(output_dir, "video.m3u8")
+    segment_pattern = _seg_pattern(output_dir, fmt)
+    cmd = [
+        "ffmpeg",
+        "-y",
+        "-hide_banner",
+        "-fflags",
+        "+genpts",
+        "-i",
+        input_path,
+        "-map",
+        "0:v:0",
+        "-an",
+        "-sn",
+        "-dn",
+        "-c:v",
+        "copy",
+        "-avoid_negative_ts",
+        "make_zero",
+        "-muxdelay",
+        "0",
+    ]
+    if fmt == "fmp4":
+        cmd += [
+            "-hls_segment_type",
+            "fmp4",
+            "-hls_fmp4_init_filename",
+            "init.mp4",
+        ]
+    cmd += [
+        "-hls_time",
+        str(seg),
+        "-hls_playlist_type",
+        "vod",
+        "-hls_flags",
+        "independent_segments",
+        "-hls_segment_filename",
+        segment_pattern,
+        "-f",
+        "hls",
+        playlist,
+    ]
+    return cmd
+
+
 def _seg_pattern(output_dir: str, segment_format: str, prefix: str = "%05d") -> str:
     ext = "m4s" if segment_format == "fmp4" else "ts"
     return os.path.join(output_dir, f"{prefix}.{ext}")
@@ -1476,6 +1908,7 @@ def transcode_video_command(
     lookahead: bool = True,
     bf: int = 2,
     aq: bool = True,
+    nvenc_profile: Any = _NVENC_PROFILE_FROM_ENV,
 ) -> List[str]:
     os.makedirs(output_dir, exist_ok=True)
     use_gpu = (force_gpu if force_gpu is not None else is_gpu_available())
@@ -1498,7 +1931,15 @@ def transcode_video_command(
         cmd += ["-vf", _scale_filter_for(True, width, height, align_pts=True)]
         cmd += ["-c:v", _gpu_encoder(codec)]
         cmd += _nvenc_encode_args(
-            _gpu_encoder(codec), bitrate, gop, segment_duration, "p6", lookahead, bf, aq
+            _gpu_encoder(codec),
+            bitrate,
+            gop,
+            segment_duration,
+            "p6",
+            lookahead,
+            bf,
+            aq,
+            nvenc_profile,
         )
     else:
         vf = _scale_filter_for(False, width, height, align_pts=True)
@@ -1516,7 +1957,10 @@ def transcode_video_command(
 
 
 def _filter_complex_split(
-    renditions: List[Dict[str, Any]], use_gpu: bool, align_pts: bool = False,
+    renditions: List[Dict[str, Any]],
+    use_gpu: bool,
+    align_pts: bool = False,
+    software_decode_gpu: bool = False,
 ) -> Tuple[str, List[str]]:
     """Build a split+scale filter_complex and the list of [vN] labels.
 
@@ -1524,15 +1968,37 @@ def _filter_complex_split(
     split input so every rendition's timeline starts at PTS 0, matching the
     audio path's ``asetpts=PTS-STARTPTS`` alignment.
     """
+    if software_decode_gpu and not use_gpu:
+        raise ValueError("software_decode_gpu requires GPU encoding")
+    if software_decode_gpu:
+        filters = _ffmpeg_filters()
+        missing = {"hwupload_cuda", "scale_cuda"} - filters
+        if missing:
+            raise FFmpegError(
+                "software-decode GPU mode requires FFmpeg filters: "
+                + ", ".join(sorted(missing))
+            )
+
     n = len(renditions)
-    setpts = "setpts=PTS-STARTPTS," if align_pts else ""
+    input_filters = []
+    if align_pts:
+        input_filters.append("setpts=PTS-STARTPTS")
+    if software_decode_gpu:
+        input_filters += ["format=nv12", "hwupload_cuda"]
+    input_prefix = ",".join(input_filters)
+    if input_prefix:
+        input_prefix += ","
     split_labels = "".join(f"[in{i}]" for i in range(n))
-    fc = f"[0:v]{setpts}split={n}{split_labels}"
+    fc = f"[0:v]{input_prefix}split={n}{split_labels}"
     labels = []
     for i, r in enumerate(renditions):
         w = int(r["width"])
         h = int(r["height"])
-        fc += f";[in{i}]{_scale_filter_for(use_gpu, w, h)}[v{i}]"
+        fc += (
+            f";[in{i}]"
+            f"{_scale_filter_for(use_gpu, w, h, prefer_scale_cuda=software_decode_gpu)}"
+            f"[v{i}]"
+        )
         labels.append(f"[v{i}]")
     return fc, labels
 
@@ -1548,6 +2014,8 @@ def transcode_multi_command(
     segment_format: str = "fmp4",
     preset: str = "p6",
     require_gpu: bool = False,
+    software_decode_gpu: bool = False,
+    nvenc_profile: Any = _NVENC_PROFILE_FROM_ENV,
 ) -> List[str]:
     """One decode -> split -> N scaled NVENC-encoded HLS outputs.
 
@@ -1556,12 +2024,24 @@ def transcode_multi_command(
     `<output_base_dir>/video_<height>p/video.m3u8` + segments.
     """
     os.makedirs(output_base_dir, exist_ok=True)
-    use_gpu = is_gpu_available()
+    # A required GPU command is built only after the task owns a live GPU
+    # lease. Trust that lease instead of launching a separate one-frame NVENC
+    # process immediately before the real encode.
+    use_gpu = True if require_gpu else is_gpu_available()
     if require_gpu and not use_gpu:
         raise FFmpegError(
             "GPU lease was acquired but NVENC/CUDA is no longer available"
         )
-    if use_gpu and not _gpu_encoder(codec).endswith("_nvenc"):
+    if software_decode_gpu and not use_gpu:
+        raise FFmpegError(
+            "software-decode GPU mode requires an available GPU"
+        )
+    primary_encoder = (
+        _required_gpu_encoder(codec)
+        if require_gpu
+        else _gpu_encoder(codec)
+    ) if use_gpu else ""
+    if use_gpu and not primary_encoder.endswith("_nvenc"):
         if require_gpu:
             raise FFmpegError(
                 f"no NVENC encoder is available for codec {codec}"
@@ -1570,11 +2050,18 @@ def transcode_multi_command(
     gop = _gop_size(fps, segment_duration)
 
     cmd = ["ffmpeg", "-y", "-hide_banner"]
-    if use_gpu:
+    if use_gpu and software_decode_gpu:
+        cmd += _cuda_filter_device_args(gpu_index)
+    elif use_gpu:
         cmd += select_hwaccel_args(gpu_index, True)
     cmd += ["-i", input_path]
 
-    fc, labels = _filter_complex_split(renditions, use_gpu, align_pts=True)
+    fc, labels = _filter_complex_split(
+        renditions,
+        use_gpu,
+        align_pts=True,
+        software_decode_gpu=software_decode_gpu,
+    )
     cmd += ["-filter_complex", fc]
 
     for i, r in enumerate(renditions):
@@ -1588,16 +2075,23 @@ def transcode_multi_command(
         seg_pat = _seg_pattern(rdir, segment_format)
         cmd += ["-map", labels[i]]
         if use_gpu:
-            enc = _gpu_encoder(rc)
-            if (
-                require_gpu
-                and enc != _GPU_CODEC_ENCODERS.get(str(rc).lower())
-            ):
-                raise FFmpegError(
-                    f"required NVENC encoder is unavailable for codec {rc}"
-                )
+            enc = (
+                _required_gpu_encoder(rc)
+                if require_gpu
+                else _gpu_encoder(rc)
+            )
             cmd += ["-c:v", enc]
-            cmd += _nvenc_encode_args(enc, bitrate, gop, segment_duration, preset, True, 2, True)
+            cmd += _nvenc_encode_args(
+                enc,
+                bitrate,
+                gop,
+                segment_duration,
+                preset,
+                True,
+                2,
+                True,
+                nvenc_profile,
+            )
         else:
             enc = _cpu_encoder(rc)
             cmd += ["-c:v", enc, "-threads", "0"]
@@ -1627,6 +2121,8 @@ def transcode_chunk_command(
     cpu_threads: int = 2,
     require_gpu: bool = False,
     require_cpu_codec: bool = False,
+    software_decode_gpu: bool = False,
+    nvenc_profile: Any = _NVENC_PROFILE_FROM_ENV,
 ) -> List[str]:
     """Encode one [start_sec, start_sec+duration_sec) slice for all renditions.
 
@@ -1638,17 +2134,34 @@ def transcode_chunk_command(
     os.makedirs(output_dir, exist_ok=True)
     if force_software and require_gpu:
         raise ValueError("force_software and require_gpu are mutually exclusive")
+    if force_software and software_decode_gpu:
+        raise ValueError(
+            "force_software and software_decode_gpu are mutually exclusive"
+        )
     if require_cpu_codec and not force_software:
         raise ValueError(
             "require_cpu_codec is only valid with force_software"
         )
-    gpu_available = False if force_software else is_gpu_available()
+    gpu_available = (
+        False
+        if force_software
+        else (True if require_gpu else is_gpu_available())
+    )
     use_gpu = gpu_available and not force_software
     if require_gpu and not use_gpu:
         raise FFmpegError(
             "GPU lease was acquired but NVENC/CUDA is no longer available"
         )
-    if use_gpu and not _gpu_encoder(codec).endswith("_nvenc"):
+    if software_decode_gpu and not use_gpu:
+        raise FFmpegError(
+            "software-decode GPU mode requires an available GPU"
+        )
+    primary_encoder = (
+        _required_gpu_encoder(codec)
+        if require_gpu
+        else _gpu_encoder(codec)
+    ) if use_gpu else ""
+    if use_gpu and not primary_encoder.endswith("_nvenc"):
         if require_gpu:
             raise FFmpegError(
                 f"no NVENC encoder is available for codec {codec}"
@@ -1661,13 +2174,23 @@ def transcode_chunk_command(
         bounded_cpu_threads = 2
 
     cmd = ["ffmpeg", "-y", "-hide_banner"]
+    if use_gpu and software_decode_gpu:
+        cmd += _cuda_filter_device_args(gpu_index)
     # Fast seek before input for speed; accurate enough with forced keyframes.
     cmd += ["-ss", f"{float(start_sec):.3f}"]
-    if use_gpu:
+    if use_gpu and not software_decode_gpu:
         cmd += select_hwaccel_args(gpu_index, True)
-    cmd += ["-i", input_path, "-t", f"{float(duration_sec):.3f}"]
+    # Keep the range limit on the input. An output-scoped ``-t`` only applies
+    # to the next output file, so a multi-rendition chunk could otherwise let
+    # later outputs continue through the rest of the source.
+    cmd += ["-t", f"{float(duration_sec):.3f}", "-i", input_path]
 
-    fc, labels = _filter_complex_split(renditions, use_gpu, align_pts=True)
+    fc, labels = _filter_complex_split(
+        renditions,
+        use_gpu,
+        align_pts=True,
+        software_decode_gpu=software_decode_gpu,
+    )
     if not use_gpu:
         cmd += ["-filter_complex_threads", str(bounded_cpu_threads)]
     cmd += ["-filter_complex", fc]
@@ -1683,16 +2206,23 @@ def transcode_chunk_command(
         seg_pat = os.path.join(rdir, f"chunk_%05d.{'m4s' if segment_format == 'fmp4' else 'ts'}")
         cmd += ["-map", labels[i]]
         if use_gpu:
-            enc = _gpu_encoder(rc)
-            if (
-                require_gpu
-                and enc != _GPU_CODEC_ENCODERS.get(str(rc).lower())
-            ):
-                raise FFmpegError(
-                    f"required NVENC encoder is unavailable for codec {rc}"
-                )
+            enc = (
+                _required_gpu_encoder(rc)
+                if require_gpu
+                else _gpu_encoder(rc)
+            )
             cmd += ["-c:v", enc]
-            cmd += _nvenc_encode_args(enc, bitrate, gop, segment_duration, "p6", True, 2, True)
+            cmd += _nvenc_encode_args(
+                enc,
+                bitrate,
+                gop,
+                segment_duration,
+                "p6",
+                True,
+                2,
+                True,
+                nvenc_profile,
+            )
         else:
             enc = _cpu_encoder(rc)
             if (
@@ -1822,6 +2352,49 @@ def _audio_filter_chain(
     return ",".join(filters)
 
 
+def _can_passthrough_aac(
+    *,
+    source_codec: Optional[str],
+    source_profile: Any,
+    source_channels: Any,
+    source_sample_rate: Any,
+    output_channels: Any,
+    loudnorm: bool,
+    audio_delay_ms: Optional[float],
+    output_sample_rate: int = 48000,
+) -> bool:
+    """Return whether AAC can be copied without bypassing required work.
+
+    Unknown stream metadata is deliberately ineligible. Delay magnitudes below
+    one millisecond are eligible because the existing filter path does not
+    apply a delay/trim adjustment for them either.
+    """
+    codec = (source_codec or "").strip().lower()
+    profile = str(source_profile or "").strip().lower()
+    if (
+        codec != "aac"
+        or profile not in {"lc", "aac lc", "low complexity", "mpeg-4 aac lc"}
+        or loudnorm
+    ):
+        return False
+    try:
+        source_channel_count = int(source_channels)
+        output_channel_count = int(output_channels)
+        source_rate = int(source_sample_rate)
+        output_rate = int(output_sample_rate)
+        delay = float(audio_delay_ms or 0.0)
+    except (TypeError, ValueError):
+        return False
+    return (
+        source_channel_count > 0
+        and source_channel_count == output_channel_count
+        and source_rate > 0
+        and source_rate == output_rate
+        and math.isfinite(delay)
+        and abs(delay) < 1.0
+    )
+
+
 def extract_audio_command(
     input_path: str,
     output_path: str,
@@ -1830,6 +2403,7 @@ def extract_audio_command(
     channels: int,
     language: str = "und",
     audio_delay_ms: Optional[float] = None,
+    loudnorm: bool = False,
 ) -> List[str]:
     """Extract one audio track to an m4a (two-step fallback path).
 
@@ -1838,7 +2412,12 @@ def extract_audio_command(
     re-applied so lipsync is preserved.
     """
     os.makedirs(os.path.dirname(output_path), exist_ok=True)
-    af = _audio_filter_chain([], audio_delay_ms)
+    base = (
+        ["loudnorm=I=-16:LRA=11:TP=-1.5:linear=true"]
+        if loudnorm
+        else []
+    )
+    af = _audio_filter_chain(base, audio_delay_ms)
     cmd = [
         "ffmpeg",
         "-y",
@@ -1874,15 +2453,20 @@ def combined_audio_command(
     segment_duration: int = SEGMENT_DURATION,
     loudnorm: bool = True,
     source_codec: str = None,
+    source_profile: Any = None,
     audio_delay_ms: Optional[float] = None,
+    aac_passthrough_enabled: bool = False,
+    source_channels: Any = None,
+    source_sample_rate: Any = None,
 ) -> List[str]:
-    """One-pass audio: extract -> re-encode/align -> AAC HLS segments.
+    """One-pass audio: safely copy AAC or re-encode it to HLS segments.
 
     The output is forced to start at PTS 0 (matching the video path) and
     mpegts muxdelay is disabled so the packaged HLS audio timeline aligns
     with the video timeline. If the source carried an intentional audio
     delay (``audio_delay_ms``), it is re-applied with ``adelay`` so the
-    relative audio/video offset is preserved.
+    relative audio/video offset is preserved. AAC passthrough is used only
+    when no filter, channel conversion, or sample-rate conversion is needed.
     """
     os.makedirs(output_dir, exist_ok=True)
     playlist = os.path.join(output_dir, "audio.m3u8")
@@ -1894,20 +2478,33 @@ def combined_audio_command(
         "-map", f"0:a:{stream_index}",
         "-sn", "-vn",
     ]
-    is_aac = (source_codec or "").lower() in ("aac", "mp3")
-    if is_aac:
-        base: List[str] = []
+    passthrough = bool(aac_passthrough_enabled) and _can_passthrough_aac(
+        source_codec=source_codec,
+        source_profile=source_profile,
+        source_channels=source_channels,
+        source_sample_rate=source_sample_rate,
+        output_channels=channels,
+        loudnorm=loudnorm,
+        audio_delay_ms=audio_delay_ms,
+    )
+    if passthrough:
+        cmd += ["-c:a", "copy"]
     else:
         if loudnorm:
-            # linear=true runs a single pass (instead of the slow two-pass dynamic
-            # mode) and is widely used in production for ~50% lower audio latency.
-            base = ["loudnorm=I=-16:LRA=11:TP=-1.5:linear=true"]
+            # linear=true runs a single pass (instead of the slow two-pass
+            # dynamic mode) and is widely used in production for ~50%
+            # lower audio latency.
+            base: List[str] = [
+                "loudnorm=I=-16:LRA=11:TP=-1.5:linear=true"
+            ]
         else:
             base = []
-    cmd += ["-af", _audio_filter_chain(base, audio_delay_ms)]
+        cmd += ["-af", _audio_filter_chain(base, audio_delay_ms)]
+        cmd += [
+            "-c:a", "aac", "-b:a", f"{int(bitrate_kbps)}k",
+            "-ac", str(int(channels)), "-ar", "48000",
+        ]
     cmd += [
-        "-c:a", "aac", "-b:a", f"{int(bitrate_kbps)}k",
-        "-ac", str(int(channels)), "-ar", "48000",
         # Disable mpegts muxdelay so HLS ADTS segment timestamps start at 0.
         "-muxdelay", "0",
         "-hls_time", str(segment_duration),

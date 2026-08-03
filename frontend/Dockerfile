@@ -23,7 +23,7 @@ COPY . .
 # Build-time env vars; NEXT_PUBLIC_* are baked into the client bundle.
 # GATEWAY_URL and CDN_ORIGIN_URL are used by next.config.js rewrites() which are evaluated at build time.
 ARG NEXT_PUBLIC_API_BASE_URL=http://localhost/api
-ARG NEXT_PUBLIC_HLS_BASE_URL=http://localhost/hls
+ARG NEXT_PUBLIC_HLS_BASE_URL
 ARG GATEWAY_URL=http://gateway:8080
 ARG CDN_ORIGIN_URL=http://cdn-origin:8080
 ENV NEXT_PUBLIC_API_BASE_URL=${NEXT_PUBLIC_API_BASE_URL}

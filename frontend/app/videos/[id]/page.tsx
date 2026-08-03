@@ -13,6 +13,7 @@ import {
   pollVideoStatus,
   pollVideoProgress,
 } from '@/lib/api';
+import { resolveManifestUrl } from '@/lib/manifest-url.mjs';
 import { Video, SignedUrlResponse, ProcessingProgress } from '@/types/video';
 import {
   Loader2,
@@ -223,11 +224,7 @@ function VideoPlayerPageContent({ id }: { id: string }) {
         {!pageLoading && !error && video && signedManifest && video.status === 'ready' && (
           <div className="space-y-6">
             <Player
-              manifestUrl={
-                process.env.NEXT_PUBLIC_HLS_BASE_URL
-                  ? new URL(signedManifest.url, process.env.NEXT_PUBLIC_HLS_BASE_URL).href
-                  : signedManifest.url
-              }
+              manifestUrl={resolveManifestUrl(signedManifest.url)}
               title={video.title}
               poster={video.thumbnailUrl}
               onError={(err) => setError(err.message)}

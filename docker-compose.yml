@@ -249,7 +249,7 @@ services:
       HOSTNAME: "0.0.0.0"
       NODE_ENV: ${NODE_ENV:-production}
       NEXT_PUBLIC_API_BASE_URL: ${NEXT_PUBLIC_API_BASE_URL:-http://localhost/api}
-      NEXT_PUBLIC_HLS_BASE_URL: ${NEXT_PUBLIC_HLS_BASE_URL:-http://localhost/hls}
+      NEXT_PUBLIC_HLS_BASE_URL: ${NEXT_PUBLIC_HLS_BASE_URL:-}
       GATEWAY_URL: ${GATEWAY_URL:-http://gateway:8080}
     networks:
       - hls-engine
@@ -493,10 +493,12 @@ services:
       # consistency. The Prometheus /metrics endpoint is served on this same
       # 8080 port — scrape transcoder-api:8080/metrics (10s interval).
       GPU_REGISTRY_ENABLED: ${GPU_REGISTRY_ENABLED:-true}
-      NVENC_MAX_SESSIONS: ${NVENC_MAX_SESSIONS:-3}
+      NVENC_MAX_SESSIONS: ${NVENC_MAX_SESSIONS:-2}
+      NVENC_PROFILE: ${NVENC_PROFILE:-}
       HLS_SEGMENT_FORMAT: ${HLS_SEGMENT_FORMAT:-fmp4}
       VIDEO_CODEC: ${VIDEO_CODEC:-h264}
-      # Single-pass is the audited safe default until chunk retry fencing exists.
+      VIDEO_PASSTHROUGH_ENABLED: ${VIDEO_PASSTHROUGH_ENABLED:-false}
+      # Chunking is fenced but remains opt-in; benchmark it for the target hardware.
       CHUNKED_ENCODING: ${CHUNKED_ENCODING:-false}
       CHUNK_DURATION_SEC: ${CHUNK_DURATION_SEC:-60}
       CHUNK_MIN_DURATION_SEC: ${CHUNK_MIN_DURATION_SEC:-600}
@@ -508,6 +510,7 @@ services:
       FFMPEG_TASK_RUNTIME_MARGIN_SEC: ${FFMPEG_TASK_RUNTIME_MARGIN_SEC:-900}
       PER_TITLE_ENCODING: ${PER_TITLE_ENCODING:-true}
       LOUDNORM: ${LOUDNORM:-true}
+      AAC_PASSTHROUGH_ENABLED: ${AAC_PASSTHROUGH_ENABLED:-false}
       TRICKPLAY: ${TRICKPLAY:-true}
       TRANSCODER_METRICS_ENABLED: ${TRANSCODER_METRICS_ENABLED:-true}
       WORKSPACE_REAPER_ENABLED: ${WORKSPACE_REAPER_ENABLED:-true}
@@ -588,10 +591,11 @@ services:
       NVIDIA_VISIBLE_DEVICES: all
       GPU_WORKER_ID: ${GPU_WORKER_ID:-}
       GPU_REGISTRY_ENABLED: ${GPU_REGISTRY_ENABLED:-true}
-      NVENC_MAX_SESSIONS: ${NVENC_MAX_SESSIONS:-3}
+      NVENC_MAX_SESSIONS: ${NVENC_MAX_SESSIONS:-2}
+      NVENC_PROFILE: ${NVENC_PROFILE:-}
       HLS_SEGMENT_FORMAT: ${HLS_SEGMENT_FORMAT:-fmp4}
       VIDEO_CODEC: ${VIDEO_CODEC:-h264}
-      # Single-pass is the audited safe default until chunk retry fencing exists.
+      # Chunking is fenced but remains opt-in; benchmark it for the target hardware.
       CHUNKED_ENCODING: ${CHUNKED_ENCODING:-false}
       CHUNK_DURATION_SEC: ${CHUNK_DURATION_SEC:-60}
       CHUNK_MIN_DURATION_SEC: ${CHUNK_MIN_DURATION_SEC:-600}
@@ -683,10 +687,12 @@ services:
       # Multi-GPU / optimization settings (kept consistent with the GPU
       # worker so pipeline config reads the same values everywhere).
       GPU_REGISTRY_ENABLED: ${GPU_REGISTRY_ENABLED:-true}
-      NVENC_MAX_SESSIONS: ${NVENC_MAX_SESSIONS:-3}
+      NVENC_MAX_SESSIONS: ${NVENC_MAX_SESSIONS:-2}
+      NVENC_PROFILE: ${NVENC_PROFILE:-}
       HLS_SEGMENT_FORMAT: ${HLS_SEGMENT_FORMAT:-fmp4}
       VIDEO_CODEC: ${VIDEO_CODEC:-h264}
-      # Single-pass is the audited safe default until chunk retry fencing exists.
+      VIDEO_PASSTHROUGH_ENABLED: ${VIDEO_PASSTHROUGH_ENABLED:-false}
+      # Chunking is fenced but remains opt-in; benchmark it for the target hardware.
       CHUNKED_ENCODING: ${CHUNKED_ENCODING:-false}
       CHUNK_DURATION_SEC: ${CHUNK_DURATION_SEC:-60}
       CHUNK_MIN_DURATION_SEC: ${CHUNK_MIN_DURATION_SEC:-600}
@@ -698,6 +704,7 @@ services:
       FFMPEG_TASK_RUNTIME_MARGIN_SEC: ${FFMPEG_TASK_RUNTIME_MARGIN_SEC:-900}
       PER_TITLE_ENCODING: ${PER_TITLE_ENCODING:-true}
       LOUDNORM: ${LOUDNORM:-true}
+      AAC_PASSTHROUGH_ENABLED: ${AAC_PASSTHROUGH_ENABLED:-false}
       TRICKPLAY: ${TRICKPLAY:-true}
       TRANSCODER_METRICS_ENABLED: ${TRANSCODER_METRICS_ENABLED:-true}
       FFMPEG_STALL_TIMEOUT_SEC: ${FFMPEG_STALL_TIMEOUT_SEC:-300}
@@ -761,10 +768,12 @@ services:
       GPU_ENABLED: "true"
       # Multi-GPU / optimization settings (kept consistent with the workers).
       GPU_REGISTRY_ENABLED: ${GPU_REGISTRY_ENABLED:-true}
-      NVENC_MAX_SESSIONS: ${NVENC_MAX_SESSIONS:-3}
+      NVENC_MAX_SESSIONS: ${NVENC_MAX_SESSIONS:-2}
+      NVENC_PROFILE: ${NVENC_PROFILE:-}
       HLS_SEGMENT_FORMAT: ${HLS_SEGMENT_FORMAT:-fmp4}
       VIDEO_CODEC: ${VIDEO_CODEC:-h264}
-      # Single-pass is the audited safe default until chunk retry fencing exists.
+      VIDEO_PASSTHROUGH_ENABLED: ${VIDEO_PASSTHROUGH_ENABLED:-false}
+      # Chunking is fenced but remains opt-in; benchmark it for the target hardware.
       CHUNKED_ENCODING: ${CHUNKED_ENCODING:-false}
       CHUNK_DURATION_SEC: ${CHUNK_DURATION_SEC:-60}
       CHUNK_MIN_DURATION_SEC: ${CHUNK_MIN_DURATION_SEC:-600}
@@ -776,6 +785,7 @@ services:
       FFMPEG_TASK_RUNTIME_MARGIN_SEC: ${FFMPEG_TASK_RUNTIME_MARGIN_SEC:-900}
       PER_TITLE_ENCODING: ${PER_TITLE_ENCODING:-true}
       LOUDNORM: ${LOUDNORM:-true}
+      AAC_PASSTHROUGH_ENABLED: ${AAC_PASSTHROUGH_ENABLED:-false}
       TRICKPLAY: ${TRICKPLAY:-true}
       TRANSCODER_METRICS_ENABLED: ${TRANSCODER_METRICS_ENABLED:-true}
       STUCK_JOB_TIMEOUT_SEC: ${STUCK_JOB_TIMEOUT_SEC:-900}

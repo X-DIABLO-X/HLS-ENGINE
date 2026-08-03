@@ -4,6 +4,7 @@ import { useEffect, useState } from 'react';
 import { useParams } from 'next/navigation';
 import { Player } from '@/components/player/Player';
 import { getEmbedManifest, EmbedManifestResponse } from '@/lib/api';
+import { resolveManifestUrl } from '@/lib/manifest-url.mjs';
 import { Loader2, AlertCircle } from 'lucide-react';
 
 /**
@@ -85,11 +86,7 @@ function EmbedPageContent({ id }: { id: string }) {
   return (
     <div className="h-screen w-screen overflow-hidden bg-black">
       <Player
-        manifestUrl={
-          process.env.NEXT_PUBLIC_HLS_BASE_URL
-            ? new URL(embed.url, process.env.NEXT_PUBLIC_HLS_BASE_URL).href
-            : embed.url
-        }
+        manifestUrl={resolveManifestUrl(embed.url)}
         title={embed.title}
         onError={(err) => setError(err.message)}
       />

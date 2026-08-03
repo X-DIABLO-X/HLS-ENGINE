@@ -301,6 +301,7 @@ async def ready():
 @app.post("/jobs", response_model=SubmitJobResponse)
 async def submit_job(req: SubmitJobRequest):
     from app import models
+    from app import progress as progress_tracker
     from app.tasks.pipeline import run_pipeline
 
     video_id = req.video_id or str(uuid.uuid4())
@@ -324,6 +325,7 @@ async def submit_job(req: SubmitJobRequest):
     finally:
         db.close()
 
+    pipeline_settings = progress_tracker.get_default_settings()
     run_pipeline.delay(
         job_id=job_id,
         source_url=req.source_url,
@@ -332,6 +334,7 @@ async def submit_job(req: SubmitJobRequest):
         renditions=req.renditions,
         audio_languages=req.audio_languages,
         subtitle_languages=req.subtitle_languages,
+        settings=pipeline_settings,
     )
     transcode_jobs_total.labels(status="submitted").inc()
     return {"job_id": job_id, "video_id": video_id, "status": "submitted"}

@@ -63,6 +63,18 @@ def _video(status):
     )
 
 
+def _rendition_probe(width=1280, height=720):
+    return {
+        "streams": [
+            {
+                "codec_type": "video",
+                "width": width,
+                "height": height,
+            }
+        ]
+    }
+
+
 class PackageCompletionTests(unittest.TestCase):
     def test_completed_work_cleanup_is_confined_to_work_root(self):
         with tempfile.TemporaryDirectory() as parent:
@@ -438,6 +450,11 @@ class PackageCompletionTests(unittest.TestCase):
             with (
                 patch.object(package_module, "SessionLocal", return_value=db),
                 patch.object(
+                    package_module.ffmpeg_utils,
+                    "ffprobe",
+                    return_value=_rendition_probe(),
+                ),
+                patch.object(
                     package_module,
                     "get_settings",
                     return_value=SimpleNamespace(WORK_DIR=work_root),
@@ -535,6 +552,11 @@ class PackageCompletionTests(unittest.TestCase):
             with (
                 patch.object(package_module, "SessionLocal", return_value=db),
                 patch.object(
+                    package_module.ffmpeg_utils,
+                    "ffprobe",
+                    return_value=_rendition_probe(),
+                ),
+                patch.object(
                     package_module,
                     "get_settings",
                     return_value=SimpleNamespace(WORK_DIR=work_root),
@@ -615,6 +637,11 @@ class PackageCompletionTests(unittest.TestCase):
             with (
                 patch.object(package_module, "SessionLocal", return_value=db),
                 patch.object(
+                    package_module.ffmpeg_utils,
+                    "ffprobe",
+                    return_value=_rendition_probe(),
+                ),
+                patch.object(
                     package_module,
                     "get_settings",
                     return_value=SimpleNamespace(WORK_DIR=work_root),
@@ -686,6 +713,11 @@ class PackageCompletionTests(unittest.TestCase):
 
             with (
                 patch.object(package_module, "SessionLocal", return_value=db),
+                patch.object(
+                    package_module.ffmpeg_utils,
+                    "ffprobe",
+                    return_value=_rendition_probe(),
+                ),
                 patch.object(
                     package_module,
                     "get_settings",

@@ -17,7 +17,8 @@ default, with an optional NVIDIA NVENC worker.
 ## Features
 
 - Managed, resumable multipart uploads for large source files
-- Adaptive HLS output with configurable 360p, 480p, 720p, and 1080p renditions
+- Adaptive HLS output with configurable, aspect-preserving 360p, 480p, 720p,
+  and 1080p bounding boxes
 - Multiple audio tracks and WebVTT subtitle tracks
 - CPU transcoding with optional NVIDIA NVENC acceleration
 - Retry-aware Celery workers with bounded FFmpeg shutdown and stall detection
@@ -164,6 +165,67 @@ AV1 closed before publishing partial output. Keep
 `TRANSCODER_GPU_CONCURRENCY=1` unless the host and encoder session limits have
 been measured for the intended rendition set.
 
+### Acceleration controls
+
+The GPU image builds FFmpeg 8.1.2 from the checksum-pinned official release
+archive. Its image build verifies the version, `h264_nvenc`, and `scale_cuda`
+before the worker is published. NVIDIA driver libraries still come from the
+host through the container runtime.
+
+Rendition dimensions are maximum bounding boxes, not dimensions that stretch
+the source. Rungs above the source height are omitted, widths are capped, and
+the scaler preserves the display aspect ratio inside these boxes:
+
+| Nominal rung | Maximum box |
+|---|---:|
+| 1080p | 1920x1080 |
+| 720p | 1280x720 |
+| 480p | 854x480 |
+| 360p | 640x360 |
+
+For example, the benchmark's 1920x804 cinematic source produced 1280x536 and
+854x358 video inside the nominal 720p and 480p boxes.
+
+`NVENC_PROFILE` selects an explicit speed/quality tradeoff. Leaving it unset
+preserves the existing audited command:
+
+| Profile | NVENC settings | Intended use |
+|---|---|---|
+| `turbo` | p3, single pass, lookahead 0 | Lowest encoding latency |
+| `balanced` | p4, quarter-resolution multipass, lookahead 12 | General speed/quality tradeoff |
+| `quality` | p6, full-resolution multipass, lookahead 32, spatial AQ | Highest compression effort |
+
+The production GPU path groups renditions into one FFmpeg process. Tests on
+the RTX 4050 Laptop GPU found that separate rendition processes and temporal
+chunks were slower than a grouped command: they time-share the same saturated
+NVENC block while adding demux, CUDA-context, boundary, and stitching
+overhead. A container or sandbox isolates a job but does not add another
+physical encoder. Temporal chunks remain useful for bounded CPU recovery and
+can improve speed when dispatched to genuinely separate GPUs or hosts.
+
+Both passthrough optimizations are strict, opt-in, and fail safe:
+
+- `VIDEO_PASSTHROUGH_ENABLED=true` permits a single source-resolution H.264
+  remux only for progressive 8-bit `yuv420p`, square-pixel, unrotated sources
+  with supported profile, level, dimensions, frame rate, duration, and
+  bitrate metadata. It never creates a mixed copy/encode ladder. An ineligible
+  source uses the normal encoded ladder; a remux or validation failure
+  atomically replaces the copy attempt with that complete ladder.
+- `AAC_PASSTHROUGH_ENABLED=true` copies only 48 kHz AAC-LC with the requested
+  channel count when no loudness, resampling, delay, or trim operation is
+  required. Every other track, and every failed copy attempt, follows the
+  validated AAC encode path.
+
+The Windows-native
+[Intel QSV worker](services/transcoder/qsv_worker/README.md) is a proof of
+concept only. It is not connected to Celery, storage, database state, or the
+production Compose pipeline. Its measured 480p quality was substantially below
+NVENC at the tested settings, so hybrid QSV/NVENC operation is not enabled in
+production.
+
+The isolated acceleration matrix, limitations, projected encode-only samples,
+and reproduction commands are in [BENCHMARK.md](BENCHMARK.md).
+
 ## Configuration
 
 Runtime configuration comes from `.env`; `.env.example` is the canonical
@@ -268,4 +330,6 @@ security issues privately as described in [SECURITY.md](SECURITY.md).
 
 HLS-ENGINE source code is available under the [MIT License](LICENSE).
 Third-party software, codecs, container images, and media retain their own
-licenses and terms.
+licenses and terms. In particular, the accelerated GPU image contains a
+GPL-enabled FFmpeg build; distributors should follow the
+[transcoder image licensing and source guidance](services/transcoder/THIRD_PARTY_NOTICES.md).
