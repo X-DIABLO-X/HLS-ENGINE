@@ -31,7 +31,7 @@ pycparser==3.0
 pycryptodome==3.23.0
 pydantic==2.13.4
 pydantic-settings==2.14.2
-pydantic_core==2.46.4
+pydantic_core==2.47.0
 python-dateutil==2.9.0.post0
 python-dotenv==1.2.2
 PyYAML==6.0.3
