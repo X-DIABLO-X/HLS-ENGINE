@@ -1,0 +1,156 @@
+# Example Prometheus alerting rules for HLS-ENGINE.
+# Load this file from prometheus.yml via the rule_files section.
+
+groups:
+  - name: hls-engine.availability
+    interval: 30s
+    rules:
+      - alert: HighErrorRate
+        expr: |
+          (
+            sum(rate(analytics_http_requests_total{status=~"5.."}[5m]))
+            /
+            sum(rate(analytics_http_requests_total[5m]))
+          ) > 0.05
+        for: 2m
+        labels:
+          severity: critical
+        annotations:
+          summary: "High HTTP error rate"
+          description: "The error rate is {{ $value | humanizePercentage }} over the last 5 minutes."
+
+      - alert: HighLatency
+        expr: |
+          histogram_quantile(0.99,
+            sum(rate(analytics_http_request_duration_seconds_bucket[5m])) by (le)
+          ) > 1.0
+        for: 3m
+        labels:
+          severity: warning
+        annotations:
+          summary: "High request latency"
+          description: "P99 latency is {{ $value }}s for analytics requests."
+
+      - alert: ServiceDown
+        expr: up{job=~"analytics|gateway|metadata|upload|cdn-origin"} == 0
+        for: 1m
+        labels:
+          severity: critical
+        annotations:
+          summary: "{{ $labels.job }} service is down"
+          description: "The {{ $labels.instance }} target has been down for more than 1 minute."
+
+  - name: hls-engine.pipeline
+    interval: 30s
+    rules:
+      - alert: TranscodingQueueDepthHigh
+        expr: transcoding_queue_depth > 500
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Transcoding queue depth is high"
+          description: "{{ $value }} jobs are waiting in the transcode queue."
+
+      - alert: TranscodeDurationHigh
+        expr: |
+          (
+            rate(transcode_duration_seconds_sum[5m])
+            /
+            rate(transcode_duration_seconds_count[5m])
+          ) > 600
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Transcode jobs are slow"
+          description: "Average transcode duration is {{ $value }}s."
+
+      - alert: CDNLowCacheHitRatio
+        expr: |
+          (
+            rate(cdn_cache_hits_total[5m])
+            /
+            (rate(cdn_cache_hits_total[5m]) + rate(cdn_cache_misses_total[5m]))
+          ) < 0.85
+        for: 10m
+        labels:
+          severity: warning
+        annotations:
+          summary: "CDN cache hit ratio is low"
+          description: "Cache hit ratio dropped to {{ $value | humanizePercentage }}."
+
+  - name: hls-engine.analytics
+    interval: 30s
+    rules:
+      - alert: ConcurrentViewersSpike
+        expr: |
+          (
+            analytics_concurrent_viewers
+            /
+            avg_over_time(analytics_concurrent_viewers[1h])
+          ) > 3
+        for: 5m
+        labels:
+          severity: info
+        annotations:
+          summary: "Concurrent viewers spiked"
+          description: "Current viewers ({{ $value }}x the hourly average) may require scaling."
+
+      - alert: AnalyticsIngestionStopped
+        expr: |
+          sum(rate(analytics_events_ingested_total[5m])) == 0
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Analytics event ingestion stopped"
+          description: "No analytics events have been ingested in the last 5 minutes."
+
+  - name: hls-engine.gpu_encoding
+    interval: 30s
+    rules:
+      - alert: GpuUtilizationHigh
+        expr: avg by (gpu) (gpu_utilization_percent) > 95
+        for: 10m
+        labels:
+          severity: warning
+        annotations:
+          summary: "GPU utilization is high"
+          description: "GPU {{ $labels.gpu }} utilization is {{ $value }}% for more than 10 minutes."
+
+      - alert: NvencSessionsExhausted
+        expr: nvenc_sessions_active >= nvenc_sessions_max
+        for: 5m
+        labels:
+          severity: critical
+        annotations:
+          summary: "NVENC sessions exhausted"
+          description: "All NVENC sessions are in use on GPU {{ $labels.gpu }} for more than 5 minutes."
+
+      - alert: TranscodeFailureRate
+        expr: sum(rate(transcode_jobs_total{status="failed"}[10m])) / sum(rate(transcode_jobs_total[10m])) > 0.10
+        for: 10m
+        labels:
+          severity: critical
+        annotations:
+          summary: "Transcode failure rate is high"
+          description: "Transcode failure rate is {{ $value | humanizePercentage }} over the last 10 minutes."
+
+      - alert: TranscodeQueueBacklog
+        expr: transcode_queue_depth > 100
+        for: 10m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Transcode queue backlog"
+          description: "Transcode queue depth is {{ $value }} for more than 10 minutes."
+
+      - alert: TranscoderApiDown
+        expr: up{job="transcoder-api"} == 0
+        for: 1m
+        labels:
+          severity: critical
+        annotations:
+          summary: "Transcoder API is down"
+          description: "The transcoder-api target has been down for more than 1 minute."

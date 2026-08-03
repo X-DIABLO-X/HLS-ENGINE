@@ -1,0 +1,49 @@
+global:
+  scrape_interval: 15s
+  evaluation_interval: 15s
+  external_labels:
+    cluster: hls-engine
+    replica: '{{.ExternalURL}}'
+
+rule_files:
+  - 'alerts.yml'
+
+scrape_configs:
+  - job_name: 'prometheus'
+    static_configs:
+      - targets: ['localhost:9090']
+
+  - job_name: 'gateway'
+    static_configs:
+      - targets: ['gateway:8080']
+    metrics_path: /metrics
+    scrape_interval: 10s
+
+  - job_name: 'cdn-origin'
+    static_configs:
+      - targets: ['cdn-origin:8080']
+    metrics_path: /metrics
+    scrape_interval: 10s
+
+  - job_name: 'analytics'
+    static_configs:
+      - targets: ['analytics:8080']
+    metrics_path: /metrics
+    scrape_interval: 10s
+
+  - job_name: 'transcoder-api'
+    static_configs:
+      - targets: ['transcoder-api:8080']
+    metrics_path: /metrics
+    scrape_interval: 10s
+
+  # Additional services can be added here as they expose /metrics endpoints.
+  # - job_name: 'auth'
+  #   static_configs:
+  #     - targets: ['auth:8080']
+  # - job_name: 'upload'
+  #   static_configs:
+  #     - targets: ['upload:8080']
+  # - job_name: 'metadata'
+  #   static_configs:
+  #     - targets: ['metadata:8080']

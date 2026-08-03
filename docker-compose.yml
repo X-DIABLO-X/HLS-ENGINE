@@ -1,0 +1,852 @@
+services:
+  # ----------------------------------------------------------------------------
+  # Infrastructure
+  # ----------------------------------------------------------------------------
+
+  postgres:
+    image: postgres:16.14-alpine
+    container_name: hls-engine-postgres
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER:-hlsengine}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-change-me-postgres-secret}
+      POSTGRES_DB: ${POSTGRES_DB:-hlsengine}
+    volumes:
+      - postgres-data:/var/lib/postgresql/data
+      - ./infra/postgres-init:/docker-entrypoint-initdb.d:ro
+    networks:
+      - hls-engine
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-hlsengine} -d ${POSTGRES_DB:-hlsengine}"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    ports:
+      - "127.0.0.1:${POSTGRES_PORT:-5432}:5432"
+
+  redis:
+    image: redis:7.4.10-alpine
+    container_name: hls-engine-redis
+    restart: unless-stopped
+    command: redis-server --requirepass ${REDIS_PASSWORD:-change-me-redis-secret}
+    environment:
+      REDIS_PASSWORD: ${REDIS_PASSWORD:-change-me-redis-secret}
+      REDISCLI_AUTH: ${REDIS_PASSWORD:-change-me-redis-secret}
+    volumes:
+      - redis-data:/data
+    networks:
+      - hls-engine
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    ports:
+      - "127.0.0.1:${REDIS_PORT:-6379}:6379"
+
+  rabbitmq:
+    image: rabbitmq:4.3.4-management-alpine
+    container_name: hls-engine-rabbitmq
+    restart: unless-stopped
+    environment:
+      RABBITMQ_DEFAULT_USER: ${RABBITMQ_USER:-hlsengine}
+      RABBITMQ_DEFAULT_PASS: ${RABBITMQ_PASSWORD:-change-me-rabbitmq-secret}
+      RABBITMQ_DEFAULT_VHOST: ${RABBITMQ_VHOST:-/}
+      # Celery acknowledges long-running tasks only after they finish. RabbitMQ's
+      # 30-minute default closes the channel underneath feature-length encodes,
+      # so keep the broker deadline above Celery's two-hour limit plus margin.
+      RABBITMQ_CONSUMER_TIMEOUT_MS: ${RABBITMQ_CONSUMER_TIMEOUT_MS:-10800000}
+    volumes:
+      - rabbitmq-data:/var/lib/rabbitmq
+      # Mount one drop-in instead of replacing conf.d; the image's defaults
+      # remain visible and the timeout is easy to inspect at runtime.
+      - ./infra/rabbitmq/conf.d/90-consumer-timeout.conf:/etc/rabbitmq/conf.d/90-consumer-timeout.conf:ro
+    networks:
+      - hls-engine
+    healthcheck:
+      # RabbitMQ 4.3 keeps the Erlang cookie readable only by its service user.
+      # Running the CLI as root can therefore report EACCES while the broker is
+      # healthy; use the same identity as the server process.
+      test: ["CMD-SHELL", "su-exec rabbitmq rabbitmq-diagnostics -q ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    ports:
+      - "127.0.0.1:${RABBITMQ_PORT:-5672}:5672"
+      - "127.0.0.1:${RABBITMQ_MANAGEMENT_PORT:-15672}:15672"
+
+  minio:
+    image: minio/minio:RELEASE.2025-09-07T16-13-09Z
+    container_name: hls-engine-minio
+    restart: unless-stopped
+    command: server /data --console-address ":9001"
+    environment:
+      MINIO_ROOT_USER: ${MINIO_ROOT_USER:-minioadmin}
+      MINIO_ROOT_PASSWORD: ${MINIO_ROOT_PASSWORD:-change-me-minio-secret}
+      MINIO_BROWSER: ${MINIO_BROWSER:-on}
+    volumes:
+      - minio-data:/data
+    networks:
+      - hls-engine
+    healthcheck:
+      test: ["CMD", "mc", "ready", "local"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    ports:
+      - "127.0.0.1:${MINIO_API_PORT:-9000}:9000"
+      - "127.0.0.1:${MINIO_CONSOLE_PORT:-9001}:9001"
+    entrypoint: >
+      sh -c "
+        minio server /data --console-address ':9001' &
+        MINIO_PID=$$!;
+        sleep 5;
+        mc alias set local http://localhost:9000 ${MINIO_ROOT_USER:-minioadmin} ${MINIO_ROOT_PASSWORD:-change-me-minio-secret};
+        for bucket in $$(echo ${MINIO_DEFAULT_BUCKETS:-uploads-raw,hls-output,thumbnails,drm-keys} | tr ',' ' '); do
+          mc mb -p local/$$bucket || true;
+        done;
+        wait $$MINIO_PID
+      "
+
+  # ----------------------------------------------------------------------------
+  # Edge / Observability
+  # ----------------------------------------------------------------------------
+
+  nginx-cache-purger:
+    build:
+      context: ./infra/nginx/cache-purger
+      dockerfile: Dockerfile
+    container_name: hls-engine-nginx-cache-purger
+    restart: unless-stopped
+    environment:
+      HTTP_ADDR: ":8080"
+      NGINX_CACHE_ROOT: /var/cache/nginx/hls
+      NGINX_CACHE_TOMBSTONE_ROOT: /var/cache/nginx/tombstones
+      NGINX_CACHE_PURGE_SECRET: ${NGINX_CACHE_PURGE_SECRET:-change-me-nginx-cache-purge-secret}
+      NGINX_CACHE_PURGE_MAX_HEADER_BYTES: ${NGINX_CACHE_PURGE_MAX_HEADER_BYTES:-65536}
+      NGINX_CACHE_PURGE_BATCH_FILES: ${NGINX_CACHE_PURGE_BATCH_FILES:-1000}
+      NGINX_CACHE_PURGE_BATCH_DURATION: ${NGINX_CACHE_PURGE_BATCH_DURATION:-100ms}
+      NGINX_CACHE_PURGE_BATCH_PAUSE: ${NGINX_CACHE_PURGE_BATCH_PAUSE:-10ms}
+      NGINX_CACHE_PURGE_SWEEP_INTERVAL: ${NGINX_CACHE_PURGE_SWEEP_INTERVAL:-30s}
+      NGINX_CACHE_PURGE_RETRY_DELAY: ${NGINX_CACHE_PURGE_RETRY_DELAY:-1s}
+      NGINX_CACHE_PURGE_STALE_AFTER: ${NGINX_CACHE_PURGE_STALE_AFTER:-30s}
+    networks:
+      - hls-engine
+    volumes:
+      - nginx-cache:/var/cache/nginx
+    read_only: true
+    tmpfs:
+      - /tmp:size=16m,mode=1777
+    cap_drop:
+      - ALL
+    cap_add:
+      - CHOWN
+      - DAC_OVERRIDE
+      - SETGID
+      - SETUID
+    security_opt:
+      - no-new-privileges:true
+    healthcheck:
+      test: ["CMD", "wget", "--no-verbose", "--tries=1", "-O", "/dev/null", "http://localhost:8080/health"]
+      interval: 10s
+      timeout: 5s
+      start_period: 10s
+      retries: 5
+
+  nginx:
+    build:
+      context: ./infra/nginx
+      dockerfile: Dockerfile
+    container_name: hls-engine-nginx
+    restart: unless-stopped
+    environment:
+      FRONTEND_HOST: ${FRONTEND_HOST:-frontend}
+      FRONTEND_PORT: ${FRONTEND_PORT:-3000}
+      GATEWAY_HOST: ${GATEWAY_HOST:-gateway}
+      GATEWAY_PORT: ${GATEWAY_PORT:-8080}
+      CDN_ORIGIN_HOST: ${CDN_ORIGIN_HOST:-cdn-origin}
+      CDN_ORIGIN_PORT: ${CDN_ORIGIN_PORT:-8080}
+      CACHE_PURGER_HOST: ${CACHE_PURGER_HOST:-nginx-cache-purger}
+      CACHE_PURGER_PORT: ${CACHE_PURGER_PORT:-8080}
+    depends_on:
+      frontend:
+        condition: service_healthy
+      gateway:
+        condition: service_healthy
+      cdn-origin:
+        condition: service_healthy
+      nginx-cache-purger:
+        condition: service_healthy
+    networks:
+      - hls-engine
+    ports:
+      - "127.0.0.1:${NGINX_HTTP_PORT:-80}:80"
+      # This development edge serves HTTP only. Terminate TLS in a production
+      # reverse proxy or add an explicit certificate-backed 443 listener.
+    volumes:
+      - nginx-cache:/var/cache/nginx
+    healthcheck:
+      test: ["CMD-SHELL", "test -d /var/cache/nginx/hls && su nginx -s /bin/sh -c 'test -w /var/cache/nginx/hls' && wget --no-verbose --tries=1 -O /dev/null http://127.0.0.1/nginx-health"]
+      interval: 10s
+      timeout: 5s
+      start_period: 10s
+      retries: 5
+
+  prometheus:
+    image: prom/prometheus:v3.13.2
+    container_name: hls-engine-prometheus
+    restart: unless-stopped
+    command:
+      - '--config.file=/etc/prometheus/prometheus.yml'
+      - '--storage.tsdb.path=/prometheus'
+      - '--web.console.libraries=/usr/share/prometheus/console_libraries'
+      - '--web.console.templates=/usr/share/prometheus/consoles'
+    volumes:
+      - ./infra/prometheus/prometheus.yml:/etc/prometheus/prometheus.yml:ro
+      - ./infra/prometheus/alerts.yml:/etc/prometheus/alerts.yml:ro
+      - prometheus-data:/prometheus
+    networks:
+      - hls-engine
+    ports:
+      - "127.0.0.1:${PROMETHEUS_PORT:-9090}:9090"
+
+  grafana:
+    image: grafana/grafana:13.1.1
+    container_name: hls-engine-grafana
+    restart: unless-stopped
+    environment:
+      GF_SECURITY_ADMIN_USER: ${GRAFANA_ADMIN_USER:-admin}
+      GF_SECURITY_ADMIN_PASSWORD: ${GRAFANA_ADMIN_PASSWORD:-change-me-grafana-secret}
+      GF_USERS_ALLOW_SIGN_UP: "false"
+    volumes:
+      - grafana-data:/var/lib/grafana
+      - ./infra/grafana/provisioning:/etc/grafana/provisioning:ro
+    networks:
+      - hls-engine
+    ports:
+      - "127.0.0.1:${GRAFANA_PORT:-3000}:3000"
+    depends_on:
+      - prometheus
+
+  # ----------------------------------------------------------------------------
+  # Application Services
+  # ----------------------------------------------------------------------------
+
+  frontend:
+    build:
+      context: ./frontend
+      dockerfile: Dockerfile
+      args:
+        GATEWAY_URL: http://gateway:8080
+        CDN_ORIGIN_URL: http://cdn-origin:8080
+    container_name: hls-engine-frontend
+    restart: unless-stopped
+    environment:
+      # Next.js standalone server.js reads HOSTNAME to decide the listen
+      # interface. Compose injects HOSTNAME=<container id> by default, which
+      # makes the server bind to a single container IP (e.g. 172.24.0.4) that
+      # the healthcheck (localhost/[::1]) cannot reach. Pin it to 0.0.0.0.
+      HOSTNAME: "0.0.0.0"
+      NODE_ENV: ${NODE_ENV:-production}
+      NEXT_PUBLIC_API_BASE_URL: ${NEXT_PUBLIC_API_BASE_URL:-http://localhost/api}
+      NEXT_PUBLIC_HLS_BASE_URL: ${NEXT_PUBLIC_HLS_BASE_URL:-http://localhost/hls}
+      GATEWAY_URL: ${GATEWAY_URL:-http://gateway:8080}
+    networks:
+      - hls-engine
+    ports:
+      - "127.0.0.1:${FRONTEND_PORT:-3000}:3000"
+    healthcheck:
+      test: ["CMD", "wget", "--no-verbose", "--tries=1", "-O", "/dev/null", "http://127.0.0.1:3000/"]
+      interval: 10s
+      timeout: 5s
+      start_period: 20s
+      retries: 5
+    depends_on:
+      - gateway
+
+  gateway:
+    build:
+      context: .
+      dockerfile: ./services/gateway/Dockerfile
+    container_name: hls-engine-gateway
+    restart: unless-stopped
+    environment:
+      # Generic config consumed by internal/config
+      HTTP_PORT: "8080"
+      LOG_LEVEL: ${GATEWAY_LOG_LEVEL:-info}
+      REDIS_ADDR: ${REDIS_HOST:-redis}:${REDIS_PORT:-6379}
+      REDIS_PASSWORD: ${REDIS_PASSWORD:-}
+      REDIS_DB: "0"
+      RABBITMQ_URL: ${RABBITMQ_URL}
+      JWT_SECRET: ${AUTH_JWT_SECRET}
+      JWT_ACCESS_TTL: ${AUTH_JWT_ACCESS_TTL:-24h}
+      JWT_REFRESH_TTL: ${AUTH_JWT_REFRESH_TTL:-720h}
+      JWT_HMAC_SECRET: ${SIGNED_URL_SECRET}
+      API_KEY_HEADER: ${GATEWAY_API_KEY_HEADER:-X-API-Key}
+      # Service-specific upstream URLs used by main.go
+      AUTH_SERVICE_URL: ${GATEWAY_AUTH_SERVICE_URL:-http://auth:8080}
+      UPLOAD_SERVICE_URL: ${GATEWAY_UPLOAD_SERVICE_URL:-http://upload:8080}
+      METADATA_SERVICE_URL: ${GATEWAY_METADATA_SERVICE_URL:-http://metadata:8080}
+      CDN_ORIGIN_SERVICE_URL: ${GATEWAY_CDN_ORIGIN_URL:-http://cdn-origin:8080}
+      ANALYTICS_SERVICE_URL: ${GATEWAY_ANALYTICS_SERVICE_URL:-http://analytics:8080}
+    networks:
+      - hls-engine
+    healthcheck:
+      test: ["CMD", "wget", "--no-verbose", "--tries=1", "-O", "/dev/null", "http://localhost:8080/ready"]
+      interval: 10s
+      timeout: 5s
+      start_period: 15s
+      retries: 5
+    depends_on:
+      auth:
+        condition: service_healthy
+      upload:
+        condition: service_healthy
+      metadata:
+        condition: service_healthy
+      cdn-origin:
+        condition: service_healthy
+      analytics:
+        condition: service_healthy
+
+  auth:
+    build:
+      context: .
+      dockerfile: ./services/auth/Dockerfile
+    container_name: hls-engine-auth
+    restart: unless-stopped
+    environment:
+      HTTP_PORT: "8080"
+      LOG_LEVEL: ${AUTH_LOG_LEVEL:-info}
+      POSTGRES_DSN: ${DATABASE_URL}
+      REDIS_ADDR: ${REDIS_HOST:-redis}:${REDIS_PORT:-6379}
+      REDIS_PASSWORD: ${REDIS_PASSWORD:-}
+      REDIS_DB: "0"
+      JWT_SECRET: ${AUTH_JWT_SECRET}
+      JWT_ISSUER: ${AUTH_JWT_ISSUER:-hls-engine}
+      JWT_ACCESS_TTL: ${AUTH_JWT_ACCESS_TTL:-24h}
+      JWT_REFRESH_TTL: ${AUTH_JWT_REFRESH_TTL:-720h}
+    networks:
+      - hls-engine
+    healthcheck:
+      test: ["CMD", "wget", "--no-verbose", "--tries=1", "-O", "/dev/null", "http://localhost:8080/ready"]
+      interval: 10s
+      timeout: 5s
+      start_period: 15s
+      retries: 5
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+
+  upload:
+    build:
+      context: .
+      dockerfile: ./services/upload/Dockerfile
+    container_name: hls-engine-upload
+    restart: unless-stopped
+    environment:
+      HTTP_PORT: "8080"
+      LOG_LEVEL: ${UPLOAD_LOG_LEVEL:-info}
+      POSTGRES_DSN: ${DATABASE_URL}
+      REDIS_ADDR: ${REDIS_HOST:-redis}:${REDIS_PORT:-6379}
+      REDIS_PASSWORD: ${REDIS_PASSWORD:-}
+      REDIS_DB: "0"
+      RABBITMQ_URL: ${RABBITMQ_URL}
+      MINIO_ENDPOINT: ${UPLOAD_MINIO_ENDPOINT:-minio:9000}
+      MINIO_ACCESS_KEY: ${MINIO_ACCESS_KEY}
+      MINIO_SECRET_KEY: ${MINIO_SECRET_KEY}
+      MINIO_USE_SSL: ${UPLOAD_MINIO_USE_SSL:-false}
+      MINIO_BUCKET: ${UPLOAD_RAW_BUCKET:-uploads-raw}
+      # Service-specific settings used directly by the upload handler
+      UPLOAD_MAX_FILE_SIZE_BYTES: ${UPLOAD_MAX_FILE_SIZE_BYTES:-10737418240}
+      UPLOAD_CHUNK_SIZE_BYTES: ${UPLOAD_CHUNK_SIZE_BYTES:-5242880}
+      UPLOAD_RAW_BUCKET: ${UPLOAD_RAW_BUCKET:-uploads-raw}
+    networks:
+      - hls-engine
+    healthcheck:
+      test: ["CMD", "wget", "--no-verbose", "--tries=1", "-O", "/dev/null", "http://localhost:8080/ready"]
+      interval: 10s
+      timeout: 5s
+      start_period: 15s
+      retries: 5
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+      rabbitmq:
+        condition: service_healthy
+      minio:
+        condition: service_healthy
+
+  metadata:
+    build:
+      context: .
+      dockerfile: ./services/metadata/Dockerfile
+    container_name: hls-engine-metadata
+    restart: unless-stopped
+    environment:
+      HTTP_PORT: "8080"
+      LOG_LEVEL: ${METADATA_LOG_LEVEL:-info}
+      POSTGRES_DSN: ${DATABASE_URL}
+      REDIS_ADDR: ${REDIS_HOST:-redis}:${REDIS_PORT:-6379}
+      REDIS_PASSWORD: ${REDIS_PASSWORD:-}
+      REDIS_DB: "0"
+      METADATA_CACHE_TTL_SECONDS: ${METADATA_CACHE_TTL_SECONDS:-300}
+      JWT_HMAC_SECRET: ${SIGNED_URL_SECRET}
+      MINIO_ENDPOINT: ${METADATA_MINIO_ENDPOINT:-minio:9000}
+      MINIO_ACCESS_KEY: ${MINIO_ACCESS_KEY}
+      MINIO_SECRET_KEY: ${MINIO_SECRET_KEY}
+      MINIO_USE_SSL: ${METADATA_MINIO_USE_SSL:-false}
+      MINIO_RAW_BUCKET: ${METADATA_RAW_BUCKET:-uploads-raw}
+      MINIO_HLS_BUCKET: ${METADATA_HLS_BUCKET:-hls-output}
+      MINIO_THUMBNAILS_BUCKET: ${METADATA_THUMBNAILS_BUCKET:-thumbnails}
+      NGINX_CACHE_PURGER_URL: ${NGINX_CACHE_PURGER_URL:-http://nginx-cache-purger:8080}
+      NGINX_CACHE_PURGE_SECRET: ${NGINX_CACHE_PURGE_SECRET:-change-me-nginx-cache-purge-secret}
+      NGINX_CACHE_PURGE_TIMEOUT: ${NGINX_CACHE_PURGE_TIMEOUT:-10s}
+    networks:
+      - hls-engine
+    healthcheck:
+      test: ["CMD", "wget", "--no-verbose", "--tries=1", "-O", "/dev/null", "http://localhost:8080/ready"]
+      interval: 10s
+      timeout: 5s
+      start_period: 15s
+      retries: 5
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+      minio:
+        condition: service_healthy
+      nginx-cache-purger:
+        condition: service_healthy
+
+  cdn-origin:
+    build:
+      context: .
+      dockerfile: ./services/cdn-origin/Dockerfile
+    container_name: hls-engine-cdn-origin
+    restart: unless-stopped
+    environment:
+      HTTP_PORT: "8080"
+      LOG_LEVEL: ${CDN_ORIGIN_LOG_LEVEL:-info}
+      REDIS_ADDR: ${REDIS_HOST:-redis}:${REDIS_PORT:-6379}
+      REDIS_PASSWORD: ${REDIS_PASSWORD:-}
+      REDIS_DB: "0"
+      MINIO_ENDPOINT: ${CDN_ORIGIN_MINIO_ENDPOINT:-minio:9000}
+      MINIO_ACCESS_KEY: ${MINIO_ACCESS_KEY}
+      MINIO_SECRET_KEY: ${MINIO_SECRET_KEY}
+      MINIO_USE_SSL: ${CDN_ORIGIN_MINIO_USE_SSL:-false}
+      MINIO_BUCKET: ${CDN_ORIGIN_HLS_BUCKET:-hls-output}
+      JWT_HMAC_SECRET: ${SIGNED_URL_SECRET}
+      CDN_BASE_URL: ${CDN_BASE_URL:-http://localhost}
+    networks:
+      - hls-engine
+    healthcheck:
+      test: ["CMD", "wget", "--no-verbose", "--tries=1", "-O", "/dev/null", "http://localhost:8080/ready"]
+      interval: 10s
+      timeout: 5s
+      start_period: 15s
+      retries: 5
+    depends_on:
+      redis:
+        condition: service_healthy
+      minio:
+        condition: service_healthy
+
+  transcoder-api:
+    build:
+      context: ./services/transcoder
+      dockerfile: Dockerfile
+    container_name: hls-engine-transcoder-api
+    restart: unless-stopped
+    command: ["uvicorn", "app.main:app", "--host", "0.0.0.0", "--port", "8080"]
+    environment:
+      # Generic config consumed by app.config
+      DATABASE_URL: ${DATABASE_URL}
+      REDIS_URL: ${REDIS_URL}
+      CELERY_BROKER_URL: ${TRANSCODER_CELERY_BROKER_URL}
+      CELERY_RESULT_BACKEND: ${TRANSCODER_CELERY_RESULT_BACKEND}
+      CELERY_TASK_SOFT_TIME_LIMIT_SEC: ${CELERY_TASK_SOFT_TIME_LIMIT_SEC:-6900}
+      CELERY_TASK_TIME_LIMIT_SEC: ${CELERY_TASK_TIME_LIMIT_SEC:-7200}
+      CELERY_ACK_TIMEOUT_MARGIN_SEC: ${CELERY_ACK_TIMEOUT_MARGIN_SEC:-900}
+      RABBITMQ_CONSUMER_TIMEOUT_MS: ${RABBITMQ_CONSUMER_TIMEOUT_MS:-10800000}
+      RABBITMQ_URL: ${RABBITMQ_URL}
+      RABBITMQ_EXCHANGE: "hls.events"
+      MINIO_ENDPOINT: ${TRANSCODER_MINIO_ENDPOINT:-minio:9000}
+      MINIO_ACCESS_KEY: ${MINIO_ACCESS_KEY}
+      MINIO_SECRET_KEY: ${MINIO_SECRET_KEY}
+      MINIO_BUCKET: ${TRANSCODER_HLS_BUCKET:-hls-output}
+      MINIO_RAW_BUCKET: ${TRANSCODER_RAW_BUCKET:-uploads-raw}
+      MINIO_HLS_BUCKET: ${TRANSCODER_HLS_BUCKET:-hls-output}
+      MINIO_THUMBNAILS_BUCKET: ${TRANSCODER_THUMBNAILS_BUCKET:-thumbnails}
+      MINIO_SECURE: ${TRANSCODER_MINIO_USE_SSL:-false}
+      MINIO_REGION: ${MINIO_REGION:-us-east-1}
+      WORK_DIR: "/tmp/hls-work"
+      SEGMENT_DURATION: "6"
+      DEFAULT_RENDITIONS: "360,480,720,1080"
+      GPU_ENABLED: "true"
+      # Multi-GPU / optimization settings shared with the workers for config
+      # consistency. The Prometheus /metrics endpoint is served on this same
+      # 8080 port — scrape transcoder-api:8080/metrics (10s interval).
+      GPU_REGISTRY_ENABLED: ${GPU_REGISTRY_ENABLED:-true}
+      NVENC_MAX_SESSIONS: ${NVENC_MAX_SESSIONS:-3}
+      HLS_SEGMENT_FORMAT: ${HLS_SEGMENT_FORMAT:-fmp4}
+      VIDEO_CODEC: ${VIDEO_CODEC:-h264}
+      # Single-pass is the audited safe default until chunk retry fencing exists.
+      CHUNKED_ENCODING: ${CHUNKED_ENCODING:-false}
+      CHUNK_DURATION_SEC: ${CHUNK_DURATION_SEC:-60}
+      CHUNK_MIN_DURATION_SEC: ${CHUNK_MIN_DURATION_SEC:-600}
+      CPU_FALLBACK_CHUNK_DURATION_SEC: ${CPU_FALLBACK_CHUNK_DURATION_SEC:-120}
+      CPU_VIDEO_PRESET: ${CPU_VIDEO_PRESET:-veryfast}
+      CPU_FALLBACK_THREADS_PER_TASK: ${CPU_FALLBACK_THREADS_PER_TASK:-2}
+      GPU_FFMPEG_TIMEOUT_SEC: ${GPU_FFMPEG_TIMEOUT_SEC:-5400}
+      CPU_FALLBACK_FFMPEG_TIMEOUT_SEC: ${CPU_FALLBACK_FFMPEG_TIMEOUT_SEC:-5400}
+      FFMPEG_TASK_RUNTIME_MARGIN_SEC: ${FFMPEG_TASK_RUNTIME_MARGIN_SEC:-900}
+      PER_TITLE_ENCODING: ${PER_TITLE_ENCODING:-true}
+      LOUDNORM: ${LOUDNORM:-true}
+      TRICKPLAY: ${TRICKPLAY:-true}
+      TRANSCODER_METRICS_ENABLED: ${TRANSCODER_METRICS_ENABLED:-true}
+      WORKSPACE_REAPER_ENABLED: ${WORKSPACE_REAPER_ENABLED:-true}
+      WORKSPACE_CLEANUP_GRACE_SEC: ${WORKSPACE_CLEANUP_GRACE_SEC:-60}
+      WORKSPACE_CLEANUP_RETRY_SEC: ${WORKSPACE_CLEANUP_RETRY_SEC:-30}
+      WORKSPACE_CLEANUP_MAX_RETRIES: ${WORKSPACE_CLEANUP_MAX_RETRIES:-360}
+      WORKSPACE_REAPER_INTERVAL_SEC: ${WORKSPACE_REAPER_INTERVAL_SEC:-60}
+      WORKSPACE_REAPER_SCAN_LIMIT: ${WORKSPACE_REAPER_SCAN_LIMIT:-1000}
+    volumes:
+      # Read-only visibility lets /jobs/{id} prove the exact workspace is gone.
+      # All mutation remains in the lock-aware Celery cleanup task.
+      - hls-work:/tmp/hls-work:ro
+    networks:
+      - hls-engine
+    healthcheck:
+      test: ["CMD", "wget", "--no-verbose", "--tries=1", "-O", "/dev/null", "http://localhost:8080/ready"]
+      interval: 10s
+      timeout: 5s
+      start_period: 20s
+      retries: 5
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+      rabbitmq:
+        condition: service_healthy
+      minio:
+        condition: service_healthy
+
+  transcoder-gpu-worker:
+    # GPU support is opt-in because a missing or unhealthy host NVIDIA/WSL
+    # runtime can prevent the entire Compose project from starting. Pipeline
+    # routing uses the separate video_cpu queue when no live GPU heartbeat is
+    # present, so CPU fallback remains available without racing NVENC workers.
+    profiles: ["gpu"]
+    build:
+      context: ./services/transcoder
+      dockerfile: Dockerfile.gpu
+    restart: unless-stopped
+    # Reap FFmpeg/Celery child processes and mirror the worker's exit to the
+    # container so `restart: unless-stopped` can recover a dead consumer.
+    init: true
+    command: ["./celery-worker-start.sh"]
+    environment:
+      CELERY_QUEUE: video
+      CELERY_CONCURRENCY: ${TRANSCODER_GPU_CONCURRENCY:-1}
+      CELERY_LOG_LEVEL: ${TRANSCODER_WORKER_LOG_LEVEL:-info}
+      GPU_WORKER_ROLE: "true"
+      DATABASE_URL: ${DATABASE_URL}
+      REDIS_URL: ${REDIS_URL}
+      CELERY_BROKER_URL: ${TRANSCODER_CELERY_BROKER_URL}
+      CELERY_RESULT_BACKEND: ${TRANSCODER_CELERY_RESULT_BACKEND}
+      CELERY_TASK_SOFT_TIME_LIMIT_SEC: ${CELERY_TASK_SOFT_TIME_LIMIT_SEC:-6900}
+      CELERY_TASK_TIME_LIMIT_SEC: ${CELERY_TASK_TIME_LIMIT_SEC:-7200}
+      CELERY_ACK_TIMEOUT_MARGIN_SEC: ${CELERY_ACK_TIMEOUT_MARGIN_SEC:-900}
+      RABBITMQ_CONSUMER_TIMEOUT_MS: ${RABBITMQ_CONSUMER_TIMEOUT_MS:-10800000}
+      RABBITMQ_URL: ${RABBITMQ_URL}
+      RABBITMQ_EXCHANGE: "hls.events"
+      MINIO_ENDPOINT: ${TRANSCODER_MINIO_ENDPOINT:-minio:9000}
+      MINIO_ACCESS_KEY: ${MINIO_ACCESS_KEY}
+      MINIO_SECRET_KEY: ${MINIO_SECRET_KEY}
+      MINIO_BUCKET: ${TRANSCODER_HLS_BUCKET:-hls-output}
+      MINIO_RAW_BUCKET: ${TRANSCODER_RAW_BUCKET:-uploads-raw}
+      MINIO_HLS_BUCKET: ${TRANSCODER_HLS_BUCKET:-hls-output}
+      MINIO_THUMBNAILS_BUCKET: ${TRANSCODER_THUMBNAILS_BUCKET:-thumbnails}
+      MINIO_SECURE: ${TRANSCODER_MINIO_USE_SSL:-false}
+      MINIO_REGION: ${MINIO_REGION:-us-east-1}
+      WORK_DIR: "/tmp/hls-work"
+      SEGMENT_DURATION: "6"
+      DEFAULT_RENDITIONS: "360,480,720,1080"
+      GPU_ENABLED: "true"
+      # Multi-GPU scheduling & optimization. `count: all` below gives every
+      # replica access to all GPUs; the worker start script + gpu_registry
+      # claim ONE free GPU at task time via acquire_gpu() so this scales from
+      # 1 GPU now to N GPUs later without per-replica env juggling.
+      GPU_INDEX: ${GPU_INDEX:-0}
+      NVIDIA_VISIBLE_DEVICES: all
+      GPU_WORKER_ID: ${GPU_WORKER_ID:-}
+      GPU_REGISTRY_ENABLED: ${GPU_REGISTRY_ENABLED:-true}
+      NVENC_MAX_SESSIONS: ${NVENC_MAX_SESSIONS:-3}
+      HLS_SEGMENT_FORMAT: ${HLS_SEGMENT_FORMAT:-fmp4}
+      VIDEO_CODEC: ${VIDEO_CODEC:-h264}
+      # Single-pass is the audited safe default until chunk retry fencing exists.
+      CHUNKED_ENCODING: ${CHUNKED_ENCODING:-false}
+      CHUNK_DURATION_SEC: ${CHUNK_DURATION_SEC:-60}
+      CHUNK_MIN_DURATION_SEC: ${CHUNK_MIN_DURATION_SEC:-600}
+      CPU_FALLBACK_CHUNK_DURATION_SEC: ${CPU_FALLBACK_CHUNK_DURATION_SEC:-120}
+      CPU_VIDEO_PRESET: ${CPU_VIDEO_PRESET:-veryfast}
+      CPU_FALLBACK_THREADS_PER_TASK: ${CPU_FALLBACK_THREADS_PER_TASK:-2}
+      GPU_FFMPEG_TIMEOUT_SEC: ${GPU_FFMPEG_TIMEOUT_SEC:-5400}
+      CPU_FALLBACK_FFMPEG_TIMEOUT_SEC: ${CPU_FALLBACK_FFMPEG_TIMEOUT_SEC:-5400}
+      FFMPEG_TASK_RUNTIME_MARGIN_SEC: ${FFMPEG_TASK_RUNTIME_MARGIN_SEC:-900}
+      PER_TITLE_ENCODING: ${PER_TITLE_ENCODING:-true}
+      LOUDNORM: ${LOUDNORM:-true}
+      TRICKPLAY: ${TRICKPLAY:-true}
+      TRANSCODER_METRICS_ENABLED: ${TRANSCODER_METRICS_ENABLED:-true}
+      FFMPEG_STALL_TIMEOUT_SEC: ${FFMPEG_STALL_TIMEOUT_SEC:-300}
+      STUCK_JOB_TIMEOUT_SEC: ${STUCK_JOB_TIMEOUT_SEC:-900}
+      STUCK_JOB_MAX_RETRIES: ${STUCK_JOB_MAX_RETRIES:-2}
+      WATCHDOG_INTERVAL_SEC: ${WATCHDOG_INTERVAL_SEC:-300}
+      WORKSPACE_REAPER_ENABLED: ${WORKSPACE_REAPER_ENABLED:-true}
+      WORKSPACE_CLEANUP_GRACE_SEC: ${WORKSPACE_CLEANUP_GRACE_SEC:-60}
+      WORKSPACE_CLEANUP_RETRY_SEC: ${WORKSPACE_CLEANUP_RETRY_SEC:-30}
+      WORKSPACE_CLEANUP_MAX_RETRIES: ${WORKSPACE_CLEANUP_MAX_RETRIES:-360}
+      WORKSPACE_REAPER_INTERVAL_SEC: ${WORKSPACE_REAPER_INTERVAL_SEC:-60}
+      WORKSPACE_REAPER_SCAN_LIMIT: ${WORKSPACE_REAPER_SCAN_LIMIT:-1000}
+    networks:
+      - hls-engine
+    volumes:
+      - /usr/lib/wsl/lib:/usr/lib/wsl/lib:ro
+      - hls-work:/tmp/hls-work
+    healthcheck:
+      test: ["CMD", "python", "-m", "app.worker_health"]
+      interval: 30s
+      timeout: 10s
+      start_period: 30s
+      retries: 3
+    depends_on:
+      rabbitmq:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+      minio:
+        condition: service_healthy
+    deploy:
+      replicas: ${TRANSCODER_GPU_REPLICAS:-1}
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: all
+              capabilities: [gpu]
+
+  transcoder-cpu-worker:
+    build:
+      context: ./services/transcoder
+      dockerfile: Dockerfile
+    container_name: hls-engine-transcoder-cpu-worker
+    restart: unless-stopped
+    init: true
+    command: ["./celery-worker-start.sh"]
+    environment:
+      # Never race the NVENC worker for GPU-bound tasks. The pipeline explicitly
+      # selects video_cpu only when there is no live GPU worker heartbeat.
+      CELERY_QUEUE: video_cpu,audio,subtitle,thumbnail,probe,package,pipeline,celery
+      CELERY_CONCURRENCY: ${TRANSCODER_CPU_CONCURRENCY:-4}
+      CELERY_LOG_LEVEL: ${TRANSCODER_WORKER_LOG_LEVEL:-info}
+      GPU_WORKER_ROLE: "false"
+      DATABASE_URL: ${DATABASE_URL}
+      REDIS_URL: ${REDIS_URL}
+      CELERY_BROKER_URL: ${TRANSCODER_CELERY_BROKER_URL}
+      CELERY_RESULT_BACKEND: ${TRANSCODER_CELERY_RESULT_BACKEND}
+      CELERY_TASK_SOFT_TIME_LIMIT_SEC: ${CELERY_TASK_SOFT_TIME_LIMIT_SEC:-6900}
+      CELERY_TASK_TIME_LIMIT_SEC: ${CELERY_TASK_TIME_LIMIT_SEC:-7200}
+      CELERY_ACK_TIMEOUT_MARGIN_SEC: ${CELERY_ACK_TIMEOUT_MARGIN_SEC:-900}
+      RABBITMQ_CONSUMER_TIMEOUT_MS: ${RABBITMQ_CONSUMER_TIMEOUT_MS:-10800000}
+      RABBITMQ_URL: ${RABBITMQ_URL}
+      RABBITMQ_EXCHANGE: "hls.events"
+      MINIO_ENDPOINT: ${TRANSCODER_MINIO_ENDPOINT:-minio:9000}
+      MINIO_ACCESS_KEY: ${MINIO_ACCESS_KEY}
+      MINIO_SECRET_KEY: ${MINIO_SECRET_KEY}
+      MINIO_BUCKET: ${TRANSCODER_HLS_BUCKET:-hls-output}
+      MINIO_RAW_BUCKET: ${TRANSCODER_RAW_BUCKET:-uploads-raw}
+      MINIO_HLS_BUCKET: ${TRANSCODER_HLS_BUCKET:-hls-output}
+      MINIO_THUMBNAILS_BUCKET: ${TRANSCODER_THUMBNAILS_BUCKET:-thumbnails}
+      MINIO_SECURE: ${TRANSCODER_MINIO_USE_SSL:-false}
+      MINIO_REGION: ${MINIO_REGION:-us-east-1}
+      WORK_DIR: "/tmp/hls-work"
+      SEGMENT_DURATION: "6"
+      DEFAULT_RENDITIONS: "360,480,720,1080"
+      GPU_ENABLED: "true"
+      # Multi-GPU / optimization settings (kept consistent with the GPU
+      # worker so pipeline config reads the same values everywhere).
+      GPU_REGISTRY_ENABLED: ${GPU_REGISTRY_ENABLED:-true}
+      NVENC_MAX_SESSIONS: ${NVENC_MAX_SESSIONS:-3}
+      HLS_SEGMENT_FORMAT: ${HLS_SEGMENT_FORMAT:-fmp4}
+      VIDEO_CODEC: ${VIDEO_CODEC:-h264}
+      # Single-pass is the audited safe default until chunk retry fencing exists.
+      CHUNKED_ENCODING: ${CHUNKED_ENCODING:-false}
+      CHUNK_DURATION_SEC: ${CHUNK_DURATION_SEC:-60}
+      CHUNK_MIN_DURATION_SEC: ${CHUNK_MIN_DURATION_SEC:-600}
+      CPU_FALLBACK_CHUNK_DURATION_SEC: ${CPU_FALLBACK_CHUNK_DURATION_SEC:-120}
+      CPU_VIDEO_PRESET: ${CPU_VIDEO_PRESET:-veryfast}
+      CPU_FALLBACK_THREADS_PER_TASK: ${CPU_FALLBACK_THREADS_PER_TASK:-2}
+      GPU_FFMPEG_TIMEOUT_SEC: ${GPU_FFMPEG_TIMEOUT_SEC:-5400}
+      CPU_FALLBACK_FFMPEG_TIMEOUT_SEC: ${CPU_FALLBACK_FFMPEG_TIMEOUT_SEC:-5400}
+      FFMPEG_TASK_RUNTIME_MARGIN_SEC: ${FFMPEG_TASK_RUNTIME_MARGIN_SEC:-900}
+      PER_TITLE_ENCODING: ${PER_TITLE_ENCODING:-true}
+      LOUDNORM: ${LOUDNORM:-true}
+      TRICKPLAY: ${TRICKPLAY:-true}
+      TRANSCODER_METRICS_ENABLED: ${TRANSCODER_METRICS_ENABLED:-true}
+      FFMPEG_STALL_TIMEOUT_SEC: ${FFMPEG_STALL_TIMEOUT_SEC:-300}
+      STUCK_JOB_TIMEOUT_SEC: ${STUCK_JOB_TIMEOUT_SEC:-900}
+      STUCK_JOB_MAX_RETRIES: ${STUCK_JOB_MAX_RETRIES:-2}
+      WATCHDOG_INTERVAL_SEC: ${WATCHDOG_INTERVAL_SEC:-300}
+      WORKSPACE_REAPER_ENABLED: ${WORKSPACE_REAPER_ENABLED:-true}
+      WORKSPACE_CLEANUP_GRACE_SEC: ${WORKSPACE_CLEANUP_GRACE_SEC:-60}
+      WORKSPACE_CLEANUP_RETRY_SEC: ${WORKSPACE_CLEANUP_RETRY_SEC:-30}
+      WORKSPACE_CLEANUP_MAX_RETRIES: ${WORKSPACE_CLEANUP_MAX_RETRIES:-360}
+      WORKSPACE_REAPER_INTERVAL_SEC: ${WORKSPACE_REAPER_INTERVAL_SEC:-60}
+      WORKSPACE_REAPER_SCAN_LIMIT: ${WORKSPACE_REAPER_SCAN_LIMIT:-1000}
+    networks:
+      - hls-engine
+    volumes:
+      - hls-work:/tmp/hls-work
+    healthcheck:
+      test: ["CMD", "python", "-m", "app.worker_health"]
+      interval: 30s
+      timeout: 10s
+      start_period: 30s
+      retries: 3
+    depends_on:
+      rabbitmq:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+      minio:
+        condition: service_healthy
+
+  transcoder-event-worker:
+    build:
+      context: ./services/transcoder
+      dockerfile: Dockerfile
+    container_name: hls-engine-transcoder-event-worker
+    restart: unless-stopped
+    command: ["python", "-m", "app.event_consumer"]
+    environment:
+      DATABASE_URL: ${DATABASE_URL}
+      REDIS_URL: ${REDIS_URL}
+      CELERY_BROKER_URL: ${TRANSCODER_CELERY_BROKER_URL}
+      CELERY_RESULT_BACKEND: ${TRANSCODER_CELERY_RESULT_BACKEND}
+      CELERY_TASK_SOFT_TIME_LIMIT_SEC: ${CELERY_TASK_SOFT_TIME_LIMIT_SEC:-6900}
+      CELERY_TASK_TIME_LIMIT_SEC: ${CELERY_TASK_TIME_LIMIT_SEC:-7200}
+      CELERY_ACK_TIMEOUT_MARGIN_SEC: ${CELERY_ACK_TIMEOUT_MARGIN_SEC:-900}
+      RABBITMQ_CONSUMER_TIMEOUT_MS: ${RABBITMQ_CONSUMER_TIMEOUT_MS:-10800000}
+      RABBITMQ_URL: ${RABBITMQ_URL}
+      RABBITMQ_EXCHANGE: "hls.events"
+      MINIO_ENDPOINT: ${TRANSCODER_MINIO_ENDPOINT:-minio:9000}
+      MINIO_ACCESS_KEY: ${MINIO_ACCESS_KEY}
+      MINIO_SECRET_KEY: ${MINIO_SECRET_KEY}
+      MINIO_BUCKET: ${TRANSCODER_HLS_BUCKET:-hls-output}
+      MINIO_RAW_BUCKET: ${TRANSCODER_RAW_BUCKET:-uploads-raw}
+      MINIO_HLS_BUCKET: ${TRANSCODER_HLS_BUCKET:-hls-output}
+      MINIO_THUMBNAILS_BUCKET: ${TRANSCODER_THUMBNAILS_BUCKET:-thumbnails}
+      MINIO_SECURE: ${TRANSCODER_MINIO_USE_SSL:-false}
+      MINIO_REGION: ${MINIO_REGION:-us-east-1}
+      WORK_DIR: "/tmp/hls-work"
+      SEGMENT_DURATION: "6"
+      DEFAULT_RENDITIONS: "360,480,720,1080"
+      GPU_ENABLED: "true"
+      # Multi-GPU / optimization settings (kept consistent with the workers).
+      GPU_REGISTRY_ENABLED: ${GPU_REGISTRY_ENABLED:-true}
+      NVENC_MAX_SESSIONS: ${NVENC_MAX_SESSIONS:-3}
+      HLS_SEGMENT_FORMAT: ${HLS_SEGMENT_FORMAT:-fmp4}
+      VIDEO_CODEC: ${VIDEO_CODEC:-h264}
+      # Single-pass is the audited safe default until chunk retry fencing exists.
+      CHUNKED_ENCODING: ${CHUNKED_ENCODING:-false}
+      CHUNK_DURATION_SEC: ${CHUNK_DURATION_SEC:-60}
+      CHUNK_MIN_DURATION_SEC: ${CHUNK_MIN_DURATION_SEC:-600}
+      CPU_FALLBACK_CHUNK_DURATION_SEC: ${CPU_FALLBACK_CHUNK_DURATION_SEC:-120}
+      CPU_VIDEO_PRESET: ${CPU_VIDEO_PRESET:-veryfast}
+      CPU_FALLBACK_THREADS_PER_TASK: ${CPU_FALLBACK_THREADS_PER_TASK:-2}
+      GPU_FFMPEG_TIMEOUT_SEC: ${GPU_FFMPEG_TIMEOUT_SEC:-5400}
+      CPU_FALLBACK_FFMPEG_TIMEOUT_SEC: ${CPU_FALLBACK_FFMPEG_TIMEOUT_SEC:-5400}
+      FFMPEG_TASK_RUNTIME_MARGIN_SEC: ${FFMPEG_TASK_RUNTIME_MARGIN_SEC:-900}
+      PER_TITLE_ENCODING: ${PER_TITLE_ENCODING:-true}
+      LOUDNORM: ${LOUDNORM:-true}
+      TRICKPLAY: ${TRICKPLAY:-true}
+      TRANSCODER_METRICS_ENABLED: ${TRANSCODER_METRICS_ENABLED:-true}
+      STUCK_JOB_TIMEOUT_SEC: ${STUCK_JOB_TIMEOUT_SEC:-900}
+      STUCK_JOB_MAX_RETRIES: ${STUCK_JOB_MAX_RETRIES:-2}
+      WATCHDOG_INTERVAL_SEC: ${WATCHDOG_INTERVAL_SEC:-300}
+      WORKSPACE_REAPER_ENABLED: ${WORKSPACE_REAPER_ENABLED:-true}
+      WORKSPACE_CLEANUP_GRACE_SEC: ${WORKSPACE_CLEANUP_GRACE_SEC:-60}
+      WORKSPACE_CLEANUP_RETRY_SEC: ${WORKSPACE_CLEANUP_RETRY_SEC:-30}
+      WORKSPACE_CLEANUP_MAX_RETRIES: ${WORKSPACE_CLEANUP_MAX_RETRIES:-360}
+      WORKSPACE_REAPER_INTERVAL_SEC: ${WORKSPACE_REAPER_INTERVAL_SEC:-60}
+      WORKSPACE_REAPER_SCAN_LIMIT: ${WORKSPACE_REAPER_SCAN_LIMIT:-1000}
+    networks:
+      - hls-engine
+    healthcheck:
+      test: ["CMD", "python", "-c", "import pathlib; raise SystemExit(0 if b'app.event_consumer' in pathlib.Path('/proc/1/cmdline').read_bytes() else 1)"]
+      interval: 30s
+      timeout: 5s
+      start_period: 20s
+      retries: 3
+    depends_on:
+      rabbitmq:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+      minio:
+        condition: service_healthy
+
+  analytics:
+    build:
+      context: ./services/analytics
+      dockerfile: Dockerfile
+    container_name: hls-engine-analytics
+    restart: unless-stopped
+    environment:
+      ANALYTICS_PORT: "8080"
+      DATABASE_URL: ${DATABASE_URL}
+      REDIS_URL: ${REDIS_HOST:-redis}:${REDIS_PORT:-6379}
+      REDIS_PASSWORD: ${REDIS_PASSWORD:-}
+      LOG_LEVEL: ${ANALYTICS_LOG_LEVEL:-info}
+      METRICS_PATH: "/metrics"
+      RABBITMQ_URL: ${RABBITMQ_URL}
+      ANALYTICS_READ_TIMEOUT: "5s"
+      ANALYTICS_WRITE_TIMEOUT: "10s"
+      ANALYTICS_ROLLUP_HOURLY: "5m"
+      ANALYTICS_ROLLUP_DAILY: "1h"
+    networks:
+      - hls-engine
+    healthcheck:
+      test: ["CMD", "wget", "--no-verbose", "--tries=1", "-O", "/dev/null", "http://localhost:8080/ready"]
+      interval: 10s
+      timeout: 5s
+      start_period: 15s
+      retries: 5
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+      rabbitmq:
+        condition: service_healthy
+
+networks:
+  hls-engine:
+    driver: bridge
+
+volumes:
+  postgres-data:
+  redis-data:
+  rabbitmq-data:
+  minio-data:
+  nginx-cache:
+  prometheus-data:
+  grafana-data:
+  hls-work:

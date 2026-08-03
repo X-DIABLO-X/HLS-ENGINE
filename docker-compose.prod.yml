@@ -1,0 +1,32 @@
+# Production overrides for VPS deployment (no GPU, host nginx handles TLS).
+services:
+  nginx:
+    ports:
+      - "127.0.0.1:${NGINX_HTTP_PORT:-8080}:80"
+
+  frontend:
+    build:
+      args:
+        NEXT_PUBLIC_API_BASE_URL: ${NEXT_PUBLIC_API_BASE_URL:?set the public HTTPS API URL}
+        NEXT_PUBLIC_HLS_BASE_URL: ${NEXT_PUBLIC_HLS_BASE_URL:?set the public HTTPS HLS URL}
+        GATEWAY_URL: http://gateway:8080
+        CDN_ORIGIN_URL: http://cdn-origin:8080
+
+  transcoder-gpu-worker:
+    deploy:
+      replicas: 0
+
+  transcoder-api:
+    environment:
+      GPU_ENABLED: "false"
+
+  transcoder-cpu-worker:
+    environment:
+      GPU_ENABLED: "false"
+      # In CPU-only production this worker must also consume video tasks;
+      # otherwise the GPU worker is scaled to zero with no video consumer.
+      CELERY_QUEUE: video_cpu,audio,subtitle,thumbnail,probe,package,pipeline,celery
+
+  transcoder-event-worker:
+    environment:
+      GPU_ENABLED: "false"

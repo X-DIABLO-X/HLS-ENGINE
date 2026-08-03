@@ -1,0 +1,201 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  go:
+    name: Go / ${{ matrix.name }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: analytics
+            module: services/analytics
+          - name: auth
+            module: services/auth
+          - name: cdn-origin
+            module: services/cdn-origin
+          - name: gateway
+            module: services/gateway
+          - name: internal
+            module: services/internal
+          - name: metadata
+            module: services/metadata
+          - name: nginx-cache-purger
+            module: infra/nginx/cache-purger
+          - name: nginx-cache-test-origin
+            module: infra/nginx/cache-purger/testorigin
+          - name: upload
+            module: services/upload
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+
+      - name: Set up Go
+        uses: actions/setup-go@v7
+        with:
+          go-version-file: ${{ matrix.module }}/go.mod
+          cache-dependency-path: ${{ matrix.module }}/go.mod
+
+      - name: Test
+        working-directory: ${{ matrix.module }}
+        run: go test ./...
+
+      - name: Check formatting
+        working-directory: ${{ matrix.module }}
+        run: |
+          unformatted="$(gofmt -l .)"
+          if [ -n "$unformatted" ]; then
+            printf 'Run gofmt on:\n%s\n' "$unformatted" >&2
+            exit 1
+          fi
+
+      - name: Vet
+        working-directory: ${{ matrix.module }}
+        run: go vet ./...
+
+      - name: Build
+        working-directory: ${{ matrix.module }}
+        run: go build ./...
+
+  transcoder:
+    name: Transcoder / compile and unit tests
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    env:
+      TRANSCODER_CI_IMAGE: hls-engine-transcoder-ci:${{ github.sha }}
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+
+      - name: Build runtime-matched test image
+        run: docker build --tag "$TRANSCODER_CI_IMAGE" services/transcoder
+
+      - name: Compile application and tests
+        run: >-
+          docker run --rm
+          --volume "$GITHUB_WORKSPACE:/workspace:ro"
+          --workdir /workspace/services/transcoder
+          --env PYTHONPATH=/app
+          --env PYTHONPYCACHEPREFIX=/tmp/pycache
+          "$TRANSCODER_CI_IMAGE"
+          python -m compileall -q /app/app tests
+
+      - name: Run complete unit test suite
+        run: >-
+          docker run --rm
+          --volume "$GITHUB_WORKSPACE:/workspace:ro"
+          --workdir /workspace/services/transcoder
+          --env PYTHONPATH=/app
+          --env PYTHONPYCACHEPREFIX=/tmp/pycache
+          --env PYTHONWARNINGS=error::ResourceWarning
+          "$TRANSCODER_CI_IMAGE"
+          python -m unittest discover --start-directory tests --top-level-directory . --verbose
+
+      - name: Test end-to-end safety helpers
+        run: >-
+          docker run --rm
+          --volume "$GITHUB_WORKSPACE:/workspace:ro"
+          --workdir /workspace
+          --env PYTHONPATH=/app
+          --env PYTHONPYCACHEPREFIX=/tmp/pycache
+          "$TRANSCODER_CI_IMAGE"
+          python -m unittest --verbose scripts.test_e2e_pipeline
+
+  frontend:
+    name: Frontend / audit and build
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    defaults:
+      run:
+        working-directory: frontend
+    env:
+      NEXT_TELEMETRY_DISABLED: "1"
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v7
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: frontend/package-lock.json
+
+      - name: Clean install
+        run: npm ci
+
+      - name: Audit dependencies
+        run: npm audit --audit-level=high
+
+      - name: Lint
+        run: npm run lint
+
+      - name: Type-check
+        run: npm run type-check
+
+      - name: Build
+        run: npm run build
+
+  compose:
+    name: Docker Compose / configuration
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+
+      - name: Validate default stack
+        run: docker compose --env-file .env.example -f docker-compose.yml config --quiet
+
+      - name: Validate GPU profile
+        run: docker compose --env-file .env.example --profile gpu -f docker-compose.yml config --quiet
+
+      - name: Validate production overrides
+        run: >-
+          docker compose
+          --env-file .env.example
+          -f docker-compose.yml
+          -f docker-compose.prod.yml
+          config --quiet
+
+      - name: Validate production GPU overrides
+        run: >-
+          docker compose
+          --env-file .env.example
+          --profile gpu
+          -f docker-compose.yml
+          -f docker-compose.prod.yml
+          config --quiet
+
+  nginx-cache-purge:
+    name: Nginx / exact-video cache purge
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+
+      - name: Run isolated cache integration
+        run: bash infra/nginx/cache-purger/integration_test.sh

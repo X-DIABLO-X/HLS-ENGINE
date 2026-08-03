@@ -1,0 +1,38 @@
+# syntax=docker/dockerfile:1
+# Extends the shared transcoder base Dockerfile with NVIDIA runtime configuration.
+# Builds directly from the source context — no pre-built base image required.
+ARG BASE_IMAGE=python:3.11.15-slim
+FROM ${BASE_IMAGE}
+
+# Install FFmpeg. NVENC driver/CUDA libraries are injected at runtime by the
+# NVIDIA Container Toolkit (deploy.resources.reservations.devices) and the
+# /usr/lib/wsl/lib bind mount — no host-driver apt packages are needed in the image.
+RUN apt-get update && \
+    apt-get install -y --no-install-recommends \
+      ffmpeg \
+      wget \
+    && rm -rf /var/lib/apt/lists/*
+
+# NVIDIA Container Toolkit runtime configuration
+ENV NVIDIA_VISIBLE_DEVICES=all
+ENV NVIDIA_DRIVER_CAPABILITIES=compute,video,utility
+
+# Ensure FFmpeg can find NVENC encoders
+RUN ffmpeg -encoders | grep -q h264_nvenc || (echo "FFmpeg NVENC support check failed" && exit 1)
+
+WORKDIR /app
+
+COPY requirements.txt .
+RUN pip install --no-cache-dir -r requirements.txt
+
+COPY app ./app
+COPY celery-worker-start.sh .
+RUN chmod +x celery-worker-start.sh
+
+# Default to a Celery worker configured for GPU/CPU tasks.
+ENV CELERY_QUEUE=video
+ENV CELERY_CONCURRENCY=1
+ENV CELERY_LOG_LEVEL=info
+ENV GPU_WORKER_ROLE=true
+
+CMD ["/app/celery-worker-start.sh"]

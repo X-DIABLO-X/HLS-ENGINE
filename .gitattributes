@@ -1,0 +1,23 @@
+* text=auto
+
+# Container entrypoints must stay executable by Linux even when the repository
+# is cloned on Windows with core.autocrlf enabled.
+*.sh text eol=lf
+Dockerfile text eol=lf
+Dockerfile.* text eol=lf
+*.yml text eol=lf
+*.yaml text eol=lf
+
+# Preserve native Windows line endings for Windows-only helper scripts.
+*.bat text eol=crlf
+*.cmd text eol=crlf
+*.ps1 text eol=crlf
+
+# Never attempt newline conversion for binary assets.
+*.ico binary
+*.jpg binary
+*.jpeg binary
+*.png binary
+*.webp binary
+*.woff binary
+*.woff2 binary
