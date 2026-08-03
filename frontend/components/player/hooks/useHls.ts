@@ -65,6 +65,10 @@ function isSubtitleError(data: { details?: unknown; frag?: { type?: unknown } })
 export function useHls(options: UseHlsOptions): UseHlsReturn {
   const { manifestUrl, videoRef, onError, onReady } = options;
   const hlsRef = useRef<Hls | null>(null);
+  // hls.js rebuilds its audio-track list when it parses or reloads a master
+  // playlist. Keep an explicit user choice outside React state so that a
+  // playlist refresh cannot silently put the player back on DEFAULT=YES.
+  const preferredAudioTrackRef = useRef<number | null>(null);
 
   // Keep callbacks in refs so they don't destroy/recreate the Hls instance
   // on every parent render.
@@ -89,6 +93,7 @@ export function useHls(options: UseHlsOptions): UseHlsReturn {
     const video = videoRef.current;
     if (!video) return;
 
+    preferredAudioTrackRef.current = null;
     setIsLoading(true);
     setError(null);
 
@@ -111,6 +116,7 @@ export function useHls(options: UseHlsOptions): UseHlsReturn {
         setLevels(mapRenditions(data.levels));
         setCurrentLevel(hls.nextLevel === -1 ? -1 : hls.nextLevel);
         setAudioTracks(mapAudioTracks(hls.audioTracks));
+        setCurrentAudioTrack(hls.audioTrack);
         setSubtitles(mapSubtitles(hls.subtitleTracks));
         setIsLoading(false);
         onReadyRef.current?.();
@@ -118,6 +124,18 @@ export function useHls(options: UseHlsOptions): UseHlsReturn {
 
       hls.on(Hls.Events.AUDIO_TRACKS_UPDATED, (_event, data) => {
         setAudioTracks(mapAudioTracks(data.audioTracks));
+
+        const preferredTrack = preferredAudioTrackRef.current;
+        if (
+          preferredTrack !== null &&
+          preferredTrack >= 0 &&
+          preferredTrack < data.audioTracks.length &&
+          hls.audioTrack !== preferredTrack
+        ) {
+          // A source reload selects the manifest default before it emits this
+          // event. Restore the track selected from the settings menu.
+          hls.audioTrack = preferredTrack;
+        }
       });
 
       hls.on(Hls.Events.SUBTITLE_TRACKS_UPDATED, (_event, data) => {
@@ -204,7 +222,8 @@ export function useHls(options: UseHlsOptions): UseHlsReturn {
 
   const setAudioTrack = (index: number) => {
     const hls = hlsRef.current;
-    if (!hls) return;
+    if (!hls || index < 0 || index >= hls.audioTracks.length) return;
+    preferredAudioTrackRef.current = index;
     hls.audioTrack = index;
     setCurrentAudioTrack(index);
   };
