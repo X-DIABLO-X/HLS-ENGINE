@@ -6,7 +6,7 @@ from app import ffmpeg_utils
 
 
 class AudioTimelineTests(unittest.TestCase):
-    def test_video_codec_start_offset_does_not_trim_synced_audio(self):
+    def test_source_relative_stream_offset_is_preserved_for_hls(self):
         parsed = ffmpeg_utils.parse_probe(
             {
                 "format": {"start_time": "0.000", "duration": "60"},
@@ -23,9 +23,9 @@ class AudioTimelineTests(unittest.TestCase):
         )
 
         self.assertEqual(parsed["video_start_time"], 0.105)
-        self.assertEqual(parsed["audio_tracks"][0]["delay_ms"], 0.0)
+        self.assertEqual(parsed["audio_tracks"][0]["delay_ms"], -105.0)
 
-    def test_authored_audio_offset_is_measured_from_presentation_start(self):
+    def test_authored_audio_offset_is_measured_from_video_stream_start(self):
         parsed = ffmpeg_utils.parse_probe(
             {
                 "format": {"start_time": "1.000", "duration": "60"},
@@ -36,7 +36,7 @@ class AudioTimelineTests(unittest.TestCase):
             }
         )
 
-        self.assertEqual(parsed["audio_tracks"][0]["delay_ms"], 500.0)
+        self.assertEqual(parsed["audio_tracks"][0]["delay_ms"], 395.0)
 
 
 class SubtitlePackagingTests(unittest.TestCase):

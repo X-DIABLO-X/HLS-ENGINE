@@ -1393,20 +1393,19 @@ def _safe_start_time(stream: Dict[str, Any]) -> float:
         return 0.0
 
 
-def audio_delay_ms(stream: Dict[str, Any], presentation_start: float = 0.0) -> float:
-    """Return the authored audio offset from the container presentation start.
+def audio_delay_ms(stream: Dict[str, Any], video_start: float = 0.0) -> float:
+    """Return the source audio/video presentation offset in milliseconds.
 
-    A video's per-stream ``start_time`` is often codec delay (for example,
-    H.264 B-frame reordering), not the beginning of the presentation.  Using
-    it as the audio reference trims or pads every audio track even when the
-    streams are correctly synced.  Container start time is the common HLS
-    timeline instead.
+    Video and audio are packaged independently, so their streams must retain
+    the relative timestamps that a source player such as VLC uses.  Re-basing
+    both streams to zero independently drops this offset and produces a
+    language-specific lip-sync error even when the original file is correct.
 
     Codec priming metadata such as ``encoder_delay`` is deliberately ignored:
     FFmpeg's decoder/encoder handles it and it is not a program-level A/V
     offset.
     """
-    return (_safe_start_time(stream) - float(presentation_start or 0.0)) * 1000.0
+    return (_safe_start_time(stream) - float(video_start or 0.0)) * 1000.0
 
 
 def _video_rotation(stream: Dict[str, Any]) -> float:
@@ -1481,11 +1480,10 @@ def parse_probe(probe: Dict[str, Any]) -> Dict[str, Any]:
     for s in audio + subtitles:
         s["language"] = lang(s)
 
-    presentation_start = _safe_start_time(fmt)
     video_start = _safe_start_time(video)
     for a in audio:
         a["start_time"] = _safe_start_time(a)
-        a["delay_ms"] = audio_delay_ms(a, presentation_start)
+        a["delay_ms"] = audio_delay_ms(a, video_start)
 
     return {
         "duration": duration,
