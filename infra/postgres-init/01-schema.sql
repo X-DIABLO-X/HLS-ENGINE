@@ -39,6 +39,9 @@ CREATE TABLE IF NOT EXISTS api_keys (
 -- ----------------------------------------------------------------------------
 CREATE TABLE IF NOT EXISTS videos (
     id UUID PRIMARY KEY,
+    owner_user_id UUID REFERENCES users(id) ON DELETE RESTRICT,
+    share_id UUID UNIQUE,
+    share_enabled BOOLEAN NOT NULL DEFAULT FALSE,
     title VARCHAR(500) NOT NULL,
     description TEXT,
     status VARCHAR(50) NOT NULL DEFAULT 'uploading',
@@ -59,6 +62,62 @@ CREATE TABLE IF NOT EXISTS videos (
 
 CREATE INDEX IF NOT EXISTS idx_videos_status ON videos(status);
 CREATE INDEX IF NOT EXISTS idx_videos_created_at ON videos(created_at DESC);
+CREATE INDEX IF NOT EXISTS idx_videos_owner_created_at ON videos(owner_user_id, created_at DESC);
+CREATE INDEX IF NOT EXISTS idx_videos_share_id ON videos(share_id) WHERE share_enabled;
+
+-- ----------------------------------------------------------------------------
+-- Creator-owned catalog (movies, series, seasons, and playable assets)
+-- ----------------------------------------------------------------------------
+CREATE TABLE IF NOT EXISTS catalog_titles (
+    id UUID PRIMARY KEY,
+    owner_user_id UUID NOT NULL REFERENCES users(id) ON DELETE RESTRICT,
+    type VARCHAR(20) NOT NULL CHECK (type IN ('movie', 'series')),
+    title VARCHAR(500) NOT NULL,
+    synopsis TEXT,
+    genres TEXT[] NOT NULL DEFAULT '{}',
+    release_date DATE,
+    maturity_rating VARCHAR(50),
+    poster_url TEXT,
+    backdrop_url TEXT,
+    status VARCHAR(20) NOT NULL DEFAULT 'draft' CHECK (status IN ('draft', 'published')),
+    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+CREATE INDEX IF NOT EXISTS idx_catalog_titles_owner_created ON catalog_titles(owner_user_id, created_at DESC);
+
+CREATE TABLE IF NOT EXISTS catalog_seasons (
+    id UUID PRIMARY KEY,
+    series_id UUID NOT NULL REFERENCES catalog_titles(id) ON DELETE CASCADE,
+    season_number INTEGER NOT NULL CHECK (season_number >= 1),
+    title VARCHAR(500),
+    synopsis TEXT,
+    poster_url TEXT,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    UNIQUE(series_id, season_number)
+);
+
+CREATE TABLE IF NOT EXISTS catalog_playables (
+    id UUID PRIMARY KEY,
+    title_id UUID NOT NULL REFERENCES catalog_titles(id) ON DELETE CASCADE,
+    season_id UUID REFERENCES catalog_seasons(id) ON DELETE CASCADE,
+    video_id UUID NOT NULL UNIQUE REFERENCES videos(id) ON DELETE RESTRICT,
+    type VARCHAR(20) NOT NULL CHECK (type IN ('movie', 'episode')),
+    episode_number INTEGER CHECK (episode_number >= 1),
+    title VARCHAR(500) NOT NULL,
+    synopsis TEXT,
+    artwork_url TEXT,
+    status VARCHAR(20) NOT NULL DEFAULT 'draft' CHECK (status IN ('draft', 'published')),
+    share_id UUID UNIQUE,
+    share_enabled BOOLEAN NOT NULL DEFAULT FALSE,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    CHECK ((type = 'movie' AND season_id IS NULL AND episode_number IS NULL) OR
+           (type = 'episode' AND season_id IS NOT NULL AND episode_number IS NOT NULL))
+);
+CREATE UNIQUE INDEX IF NOT EXISTS idx_catalog_movie_per_title ON catalog_playables(title_id) WHERE type = 'movie';
+CREATE UNIQUE INDEX IF NOT EXISTS idx_catalog_episode_order ON catalog_playables(season_id, episode_number) WHERE type = 'episode';
+CREATE INDEX IF NOT EXISTS idx_catalog_playables_share ON catalog_playables(share_id) WHERE share_enabled;
 
 CREATE TABLE IF NOT EXISTS renditions (
     id UUID PRIMARY KEY,

@@ -38,6 +38,12 @@ export default function RootLayout({
                 Library
               </Link>
               <Link
+                href="/catalog"
+                className="text-sm font-medium text-muted-foreground transition-colors hover:text-foreground"
+              >
+                Studio
+              </Link>
+              <Link
                 href="/settings"
                 className="text-sm font-medium text-muted-foreground transition-colors hover:text-foreground"
               >

@@ -6,7 +6,12 @@ import { VideoElement } from './VideoElement';
 import { ControlBar } from './controls/ControlBar';
 import { AlertCircle, Loader2 } from 'lucide-react';
 
-function PlayerInner({ title, poster }: { title?: string; poster?: string }) {
+interface PlayerNavigation {
+  title: string;
+  onNavigate: () => void;
+}
+
+function PlayerInner({ title, poster, previous, next }: { title?: string; poster?: string; previous?: PlayerNavigation; next?: PlayerNavigation }) {
   const { containerRef, isLoading, error } = usePlayer();
   const [showControls, setShowControls] = useState(true);
   const [hideTimeout, setHideTimeout] =
@@ -66,7 +71,7 @@ function PlayerInner({ title, poster }: { title?: string; poster?: string }) {
       )}
 
       <div className="absolute inset-x-0 bottom-0 z-20">
-        <ControlBar />
+        <ControlBar previous={previous} next={next} />
       </div>
     </div>
   );
@@ -77,6 +82,8 @@ interface PlayerProps {
   originalResolution?: { width: number; height: number };
   title?: string;
   poster?: string;
+  previous?: PlayerNavigation;
+  next?: PlayerNavigation;
   onError?: (error: Error) => void;
 }
 
@@ -85,6 +92,8 @@ export function Player({
   originalResolution,
   title,
   poster,
+  previous,
+  next,
   onError,
 }: PlayerProps) {
   const [instanceKey, setInstanceKey] = useState(0);
@@ -103,7 +112,7 @@ export function Player({
       originalResolution={originalResolution}
       onError={handleError}
     >
-      <PlayerInner title={title} poster={poster} />
+      <PlayerInner title={title} poster={poster} previous={previous} next={next} />
     </PlayerProvider>
   );
 }

@@ -201,6 +201,9 @@ class Video(Base):
     __tablename__ = "videos"
 
     id = Column(UUID(as_uuid=False), primary_key=True)
+    owner_user_id = Column(UUID(as_uuid=False), nullable=True)
+    share_id = Column(UUID(as_uuid=False), nullable=True)
+    share_enabled = Column(Boolean, nullable=False, default=False)
     source_url = Column(String, nullable=False)
     title = Column(String)
     status = Column(String, default="pending")

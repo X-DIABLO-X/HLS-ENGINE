@@ -12,12 +12,12 @@ import { Loader2, AlertCircle } from 'lucide-react';
  *
  * This page is intentionally NOT wrapped in AuthGuard so it can be loaded
  * inside an <iframe> on third-party sites. The signed manifest URL returned
- * by the public /api/v1/videos/{id}/embed endpoint is the only credential
+ * by the public /api/v1/embed/{shareId} endpoint is the only credential
  * needed to stream the HLS content.
  *
  * Embed code example:
  *   <iframe
- *     src="https://your-host/embed/VIDEO_ID"
+ *     src="https://your-host/embed/SHARE_ID"
  *     width="1280" height="720"
  *     frameborder="0"
  *     allow="autoplay; fullscreen; encrypted-media"
@@ -88,6 +88,8 @@ function EmbedPageContent({ id }: { id: string }) {
       <Player
         manifestUrl={resolveManifestUrl(embed.url)}
         title={embed.title}
+        previous={embed.previous ? { title: embed.previous.title, onNavigate: () => { window.location.href = `/embed/${embed.previous?.shareId}`; } } : undefined}
+        next={embed.next ? { title: embed.next.title, onNavigate: () => { window.location.href = `/embed/${embed.next?.shareId}`; } } : undefined}
         onError={(err) => setError(err.message)}
       />
     </div>

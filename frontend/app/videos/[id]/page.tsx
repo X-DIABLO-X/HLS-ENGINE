@@ -13,6 +13,7 @@ import {
   retryVideo,
   pollVideoStatus,
   pollVideoProgress,
+  updateVideoShare,
 } from '@/lib/api';
 import { resolveManifestUrl } from '@/lib/manifest-url.mjs';
 import { Video, SignedUrlResponse, ProcessingProgress } from '@/types/video';
@@ -295,7 +296,10 @@ function VideoPlayerPageContent({ id }: { id: string }) {
                 <EmbedPanel
                   videoId={video.id}
                   title={video.title}
+                  shareId={video.shareId}
+                  shareEnabled={video.shareEnabled}
                   copied={copied}
+                  onShareChanged={(updated) => setVideo((current) => current ? { ...current, shareId: updated.shareId, shareEnabled: updated.enabled } : current)}
                   onCopied={() => {
                     setCopied(true);
                     setTimeout(() => setCopied(false), 2000);
@@ -340,19 +344,27 @@ function VideoPlayerPageContent({ id }: { id: string }) {
 function EmbedPanel({
   videoId,
   title,
+  shareId,
+  shareEnabled,
   copied,
   onCopied,
+  onShareChanged,
   onClose,
 }: {
   videoId: string;
   title: string;
+  shareId?: string;
+  shareEnabled?: boolean;
   copied: boolean;
   onCopied: () => void;
+  onShareChanged: (share: { shareId?: string; enabled: boolean }) => void;
   onClose: () => void;
 }) {
+  const [sharing, setSharing] = useState(false);
+  const [shareError, setShareError] = useState<string | null>(null);
   const origin =
     typeof window !== 'undefined' ? window.location.origin : '';
-  const embedUrl = `${origin}/embed/${videoId}`;
+  const embedUrl = shareId ? `${origin}/embed/${shareId}` : '';
   const aspect = 16 / 9;
   const embedCode = `<iframe
   src="${embedUrl}"
@@ -384,6 +396,18 @@ function EmbedPanel({
     }
   };
 
+  const updateShare = async (enabled: boolean, rotate = false) => {
+    setSharing(true);
+    setShareError(null);
+    try {
+      onShareChanged(await updateVideoShare(videoId, enabled, rotate));
+    } catch (err) {
+      setShareError(err instanceof Error ? err.message : String(err));
+    } finally {
+      setSharing(false);
+    }
+  };
+
   return (
     <div className="mt-4 rounded-xl border border-border bg-muted p-5">
       <div className="flex items-center justify-between">
@@ -397,11 +421,29 @@ function EmbedPanel({
         </button>
       </div>
       <p className="mt-1 text-xs text-muted-foreground">
-        Paste this iframe anywhere on the web to stream with our player. The
-        embed URL is public and works without authentication.
+        Only an active, opaque share link can be embedded. You can disable or
+        rotate it at any time; either action immediately revokes the old URL.
       </p>
 
-      <div className="mt-3 space-y-3">
+      <div className="mt-3 flex flex-wrap items-center gap-2">
+        {!shareEnabled || !shareId ? (
+          <button onClick={() => updateShare(true)} disabled={sharing} className="rounded-lg bg-accent px-3 py-2 text-xs font-semibold text-white disabled:opacity-50">
+            {sharing ? 'Creating link…' : 'Create share link'}
+          </button>
+        ) : (
+          <>
+            <button onClick={() => updateShare(true, true)} disabled={sharing} className="rounded-lg border border-border px-3 py-2 text-xs font-semibold text-foreground disabled:opacity-50">
+              {sharing ? 'Updating…' : 'Rotate link'}
+            </button>
+            <button onClick={() => updateShare(false)} disabled={sharing} className="rounded-lg border border-red-500/30 px-3 py-2 text-xs font-semibold text-red-400 disabled:opacity-50">
+              Disable link
+            </button>
+          </>
+        )}
+      </div>
+      {shareError && <p className="mt-2 text-xs text-red-400">{shareError}</p>}
+
+      {shareEnabled && shareId && <div className="mt-3 space-y-3">
         <div>
           <label className="text-xs font-medium text-muted-foreground">
             Embed code
@@ -493,7 +535,7 @@ function EmbedPanel({
             </button>
           </div>
         </div>
-      </div>
+      </div>}
     </div>
   );
 }

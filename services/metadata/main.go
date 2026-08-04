@@ -111,6 +111,12 @@ func main() {
 	}
 
 	repo := repository.New(pool)
+	if err := repo.MigrateCreatorCatalog(
+		context.Background(),
+		getEnv("LEGACY_CATALOG_OWNER_ID", "b47be6c6-4214-4f5c-b522-bf3afd0cf582"),
+	); err != nil {
+		log.Fatal().Err(err).Msg("migrate creator catalog")
+	}
 	srv := &server{
 		cfg:   cfg,
 		log:   log,
@@ -147,7 +153,21 @@ func main() {
 	// Public embed endpoint: returns a signed manifest URL for iframe embedding.
 	// No auth middleware — the signed token is the credential. This lets third
 	// party sites embed <iframe src="…/embed/{id}"> without a user session.
-	r.Get("/api/v1/videos/{id}/embed", srv.getEmbedManifest)
+	r.Post("/api/v1/videos/{id}/share", srv.updateVideoShare)
+	r.Get("/api/v1/catalog/titles", srv.listTitles)
+	r.Post("/api/v1/catalog/titles", srv.createTitle)
+	r.Get("/api/v1/catalog/titles/{id}", srv.getTitle)
+	r.Put("/api/v1/catalog/titles/{id}", srv.updateTitle)
+	r.Delete("/api/v1/catalog/titles/{id}", srv.deleteTitle)
+	r.Post("/api/v1/catalog/titles/{id}/seasons", srv.createSeason)
+	r.Get("/api/v1/catalog/titles/{id}/seasons", srv.listSeasons)
+	r.Post("/api/v1/catalog/titles/{id}/playables", srv.createPlayable)
+	r.Get("/api/v1/catalog/titles/{id}/playables", srv.listPlayables)
+	r.Delete("/api/v1/catalog/playables/{id}", srv.deletePlayable)
+	r.Post("/api/v1/catalog/playables/{id}/publish", srv.publishPlayable)
+	r.Post("/api/v1/catalog/playables/{id}/unpublish", srv.unpublishPlayable)
+	r.Post("/api/v1/catalog/playables/{id}/share/rotate", srv.rotatePlayableShare)
+	r.Get("/api/v1/embed/{shareID}", srv.getSharedEmbed)
 
 	// Renditions
 	r.Post("/api/v1/videos/{id}/renditions", srv.createRendition)
@@ -216,12 +236,16 @@ type createVideoReq struct {
 }
 
 func (s *server) createVideo(w http.ResponseWriter, r *http.Request) {
+	ownerID, ok := creatorID(w, r)
+	if !ok {
+		return
+	}
 	var req createVideoReq
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 		respondError(w, http.StatusBadRequest, "invalid json")
 		return
 	}
-	v, err := s.repo.CreateVideo(r.Context(), req.Title, req.Description, req.Tags)
+	v, err := s.repo.CreateVideo(r.Context(), ownerID, req.Title, req.Description, req.Tags)
 	if err != nil {
 		s.log.Error().Err(err).Msg("create video failed")
 		respondError(w, http.StatusInternalServerError, "internal error")
@@ -231,8 +255,12 @@ func (s *server) createVideo(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *server) getVideo(w http.ResponseWriter, r *http.Request) {
+	ownerID, ok := creatorID(w, r)
+	if !ok {
+		return
+	}
 	id := chi.URLParam(r, "id")
-	v, err := s.repo.GetVideo(r.Context(), id)
+	v, err := s.repo.GetOwnedVideo(r.Context(), id, ownerID)
 	if err != nil {
 		if err == repository.ErrNotFound {
 			respondError(w, http.StatusNotFound, "video not found")
@@ -245,6 +273,10 @@ func (s *server) getVideo(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *server) listVideos(w http.ResponseWriter, r *http.Request) {
+	ownerID, ok := creatorID(w, r)
+	if !ok {
+		return
+	}
 	search := r.URL.Query().Get("search")
 	status := r.URL.Query().Get("status")
 	page, _ := strconv.Atoi(r.URL.Query().Get("page"))
@@ -258,7 +290,7 @@ func (s *server) listVideos(w http.ResponseWriter, r *http.Request) {
 	if pageSize == 0 {
 		pageSize = 20
 	}
-	videos, total, err := s.repo.ListVideos(r.Context(), search, status, page, pageSize)
+	videos, total, err := s.repo.ListOwnedVideos(r.Context(), ownerID, search, status, page, pageSize)
 	if err != nil {
 		s.log.Error().Err(err).Msg("list videos failed")
 		respondError(w, http.StatusInternalServerError, "internal error")
@@ -279,7 +311,15 @@ type updateVideoReq struct {
 }
 
 func (s *server) updateVideo(w http.ResponseWriter, r *http.Request) {
+	ownerID, ok := creatorID(w, r)
+	if !ok {
+		return
+	}
 	id := chi.URLParam(r, "id")
+	if _, err := s.repo.GetOwnedVideo(r.Context(), id, ownerID); err != nil {
+		respondOwnedError(w, err)
+		return
+	}
 	var req updateVideoReq
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 		respondError(w, http.StatusBadRequest, "invalid json")
@@ -305,6 +345,25 @@ func (s *server) updateVideo(w http.ResponseWriter, r *http.Request) {
 
 func (s *server) deleteVideo(w http.ResponseWriter, r *http.Request) {
 	id := chi.URLParam(r, "id")
+	if s.repo != nil {
+		ownerID, ok := creatorID(w, r)
+		if !ok {
+			return
+		}
+		if _, err := s.repo.GetOwnedVideo(r.Context(), id, ownerID); err != nil {
+			respondOwnedError(w, err)
+			return
+		}
+		linked, err := s.repo.VideoIsLinked(r.Context(), id)
+		if err != nil {
+			respondError(w, http.StatusInternalServerError, "internal error")
+			return
+		}
+		if linked {
+			respondError(w, http.StatusConflict, "video is linked to catalog content")
+			return
+		}
+	}
 	err := s.videoDeleter.Delete(r.Context(), id)
 	switch {
 	case err == nil:
@@ -332,7 +391,15 @@ type updateStatusReq struct {
 }
 
 func (s *server) updateStatus(w http.ResponseWriter, r *http.Request) {
+	ownerID, ok := creatorID(w, r)
+	if !ok {
+		return
+	}
 	id := chi.URLParam(r, "id")
+	if _, err := s.repo.GetOwnedVideo(r.Context(), id, ownerID); err != nil {
+		respondOwnedError(w, err)
+		return
+	}
 	var req updateStatusReq
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 		respondError(w, http.StatusBadRequest, "invalid json")
@@ -355,8 +422,12 @@ func (s *server) updateStatus(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *server) getManifest(w http.ResponseWriter, r *http.Request) {
+	ownerID, ok := creatorID(w, r)
+	if !ok {
+		return
+	}
 	id := chi.URLParam(r, "id")
-	video, err := s.repo.GetVideo(r.Context(), id)
+	video, err := s.repo.GetOwnedVideo(r.Context(), id, ownerID)
 	if err != nil {
 		if err == repository.ErrNotFound {
 			respondError(w, http.StatusNotFound, "video not found")
@@ -421,15 +492,18 @@ func (s *server) getEmbedManifest(w http.ResponseWriter, r *http.Request) {
 }
 
 type createRenditionReq struct {
-	Name      string `json:"name"`
+	Name       string `json:"name"`
 	IsOriginal bool   `json:"is_original"`
-	Codec     string `json:"codec"`
-	Bandwidth int    `json:"bandwidth"`
-	Width     int    `json:"width"`
-	Height    int    `json:"height"`
+	Codec      string `json:"codec"`
+	Bandwidth  int    `json:"bandwidth"`
+	Width      int    `json:"width"`
+	Height     int    `json:"height"`
 }
 
 func (s *server) createRendition(w http.ResponseWriter, r *http.Request) {
+	if _, ok := s.ownedVideoOrReject(w, r); !ok {
+		return
+	}
 	id := chi.URLParam(r, "id")
 	var req createRenditionReq
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
@@ -445,6 +519,9 @@ func (s *server) createRendition(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *server) listRenditions(w http.ResponseWriter, r *http.Request) {
+	if _, ok := s.ownedVideoOrReject(w, r); !ok {
+		return
+	}
 	id := chi.URLParam(r, "id")
 	list, err := s.repo.ListRenditions(r.Context(), id)
 	if err != nil {
@@ -463,6 +540,9 @@ type createAudioReq struct {
 }
 
 func (s *server) createAudioTrack(w http.ResponseWriter, r *http.Request) {
+	if _, ok := s.ownedVideoOrReject(w, r); !ok {
+		return
+	}
 	id := chi.URLParam(r, "id")
 	var req createAudioReq
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
@@ -478,6 +558,9 @@ func (s *server) createAudioTrack(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *server) listAudioTracks(w http.ResponseWriter, r *http.Request) {
+	if _, ok := s.ownedVideoOrReject(w, r); !ok {
+		return
+	}
 	id := chi.URLParam(r, "id")
 	list, err := s.repo.ListAudioTracks(r.Context(), id)
 	if err != nil {
@@ -494,6 +577,9 @@ type createSubtitleReq struct {
 }
 
 func (s *server) createSubtitle(w http.ResponseWriter, r *http.Request) {
+	if _, ok := s.ownedVideoOrReject(w, r); !ok {
+		return
+	}
 	id := chi.URLParam(r, "id")
 	var req createSubtitleReq
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
@@ -509,6 +595,9 @@ func (s *server) createSubtitle(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *server) listSubtitles(w http.ResponseWriter, r *http.Request) {
+	if _, ok := s.ownedVideoOrReject(w, r); !ok {
+		return
+	}
 	id := chi.URLParam(r, "id")
 	list, err := s.repo.ListSubtitles(r.Context(), id)
 	if err != nil {
@@ -528,6 +617,9 @@ func getEnv(key, fallback string) string {
 // ---- Progress ----
 
 func (s *server) getProgress(w http.ResponseWriter, r *http.Request) {
+	if _, ok := s.ownedVideoOrReject(w, r); !ok {
+		return
+	}
 	id := chi.URLParam(r, "id")
 	ctx, cancel := context.WithTimeout(r.Context(), 2*time.Second)
 	defer cancel()
