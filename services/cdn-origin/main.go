@@ -65,6 +65,9 @@ func main() {
 	r.Get("/hls/{videoID}/{rendition}/{file:.+\\.mp4}", srv.segment)
 	r.Get("/hls/{videoID}/{rendition}/{file:.+\\.aac}", srv.segment)
 	r.Get("/hls/{videoID}/{rendition}/{file:.+\\.vtt}", srv.segment)
+	// Posters are published beside HLS output by the thumbnail task. They use
+	// the same prefix token as the manifest, avoiding a second public bucket.
+	r.Get("/hls/{videoID}/{rendition}/{file:.+\\.jpg}", srv.segment)
 
 	port := cfg.HTTPPort
 	if port == "" {

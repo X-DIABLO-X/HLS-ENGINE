@@ -247,7 +247,14 @@ func (s *Service) ProxySegment(ctx context.Context, w http.ResponseWriter, r *ht
 	}
 	defer obj.Close()
 
-	w.Header().Set("Content-Type", info.ContentType)
+	contentType := info.ContentType
+	// MinIO stores locally published JPEGs without a MIME type unless one is
+	// supplied at upload time. The library poster is an image contract, so make
+	// its wire type explicit instead of relying on browser sniffing.
+	if strings.HasSuffix(strings.ToLower(segPath), ".jpg") {
+		contentType = "image/jpeg"
+	}
+	w.Header().Set("Content-Type", contentType)
 	w.Header().Set("Accept-Ranges", "bytes")
 	w.Header().Set("Cache-Control", "private, max-age=300")
 	w.Header().Set("Content-Length", strconv.FormatInt(contentLength, 10))

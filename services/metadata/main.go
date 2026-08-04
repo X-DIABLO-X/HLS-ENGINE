@@ -269,6 +269,7 @@ func (s *server) getVideo(w http.ResponseWriter, r *http.Request) {
 		respondError(w, http.StatusInternalServerError, "internal error")
 		return
 	}
+	s.attachThumbnailURL(v)
 	respondJSON(w, http.StatusOK, v)
 }
 
@@ -296,12 +297,32 @@ func (s *server) listVideos(w http.ResponseWriter, r *http.Request) {
 		respondError(w, http.StatusInternalServerError, "internal error")
 		return
 	}
+	for _, video := range videos {
+		s.attachThumbnailURL(video)
+	}
 	respondJSON(w, http.StatusOK, map[string]interface{}{
 		"videos":   videos,
 		"page":     page,
 		"pageSize": pageSize,
 		"total":    total,
 	})
+}
+
+// attachThumbnailURL exposes the poster produced by the thumbnail pipeline.
+// It is served through the same short-lived, prefix-scoped access path as HLS
+// assets, so a library frame is not a public object merely because it is shown
+// in an authenticated creator view.
+func (s *server) attachThumbnailURL(video *repository.Video) {
+	if video == nil || video.Status != "ready" {
+		return
+	}
+	manifestPath := "/hls/" + video.ID + "/"
+	token := jwt.BuildSignedTokenPrefix(
+		[]byte(getEnv("JWT_HMAC_SECRET", "change-me-signed-url-hmac-secret")),
+		manifestPath,
+		time.Now().Add(24*time.Hour),
+	)
+	video.ThumbnailURL = "/hls/" + video.ID + "/thumbnails/poster.jpg?token=" + url.QueryEscape(token)
 }
 
 type updateVideoReq struct {

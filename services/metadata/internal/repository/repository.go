@@ -33,6 +33,7 @@ type Video struct {
 	OwnerUserID  string     `json:"ownerUserId,omitempty"`
 	ShareID      *string    `json:"shareId,omitempty"`
 	ShareEnabled bool       `json:"shareEnabled,omitempty"`
+	ThumbnailURL string     `json:"thumbnailUrl,omitempty"`
 	Title        string     `json:"title"`
 	Description  string     `json:"description,omitempty"`
 	Status       string     `json:"status"`
