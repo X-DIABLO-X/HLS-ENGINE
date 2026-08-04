@@ -13,6 +13,10 @@ import {
 import { useHls, UseHlsReturn } from './hooks/useHls';
 import { useKeyboardShortcuts } from './hooks/useKeyboardShortcuts';
 import { formatDuration } from '@/lib/api';
+import {
+  defaultSubtitleAppearance,
+  SubtitleAppearance,
+} from './subtitleAppearance';
 
 interface PlayerContextValue extends UseHlsReturn {
   videoRef: RefObject<HTMLVideoElement | null>;
@@ -33,6 +37,9 @@ interface PlayerContextValue extends UseHlsReturn {
   toggleMute: () => void;
   changeVolumeRelative: (delta: number) => void;
   toggleFullscreen: () => void;
+  subtitleAppearance: SubtitleAppearance;
+  setSubtitleAppearance: (appearance: Partial<SubtitleAppearance>) => void;
+  resetSubtitleAppearance: () => void;
   formattedCurrentTime: string;
   formattedDuration: string;
   progressPercent: number;
@@ -40,16 +47,34 @@ interface PlayerContextValue extends UseHlsReturn {
 }
 
 const PlayerContext = createContext<PlayerContextValue | null>(null);
+const subtitleAppearanceStorageKey = 'hls-engine:subtitle-appearance';
+
+function initialSubtitleAppearance(): SubtitleAppearance {
+  if (typeof window === 'undefined') return defaultSubtitleAppearance;
+  try {
+    const stored = JSON.parse(
+      window.localStorage.getItem(subtitleAppearanceStorageKey) || '{}'
+    );
+    return {
+      ...defaultSubtitleAppearance,
+      ...(stored && typeof stored === 'object' ? stored : {}),
+    };
+  } catch {
+    return defaultSubtitleAppearance;
+  }
+}
 
 interface PlayerProviderProps {
   children: React.ReactNode;
   manifestUrl: string;
+  originalResolution?: { width: number; height: number };
   onError?: (error: Error) => void;
 }
 
 export function PlayerProvider({
   children,
   manifestUrl,
+  originalResolution,
   onError,
 }: PlayerProviderProps) {
   const videoRef = useRef<HTMLVideoElement>(null);
@@ -62,10 +87,13 @@ export function PlayerProvider({
   const [duration, setDuration] = useState(0);
   const [buffered, setBuffered] = useState(0);
   const [isFullscreen, setIsFullscreen] = useState(false);
+  const [subtitleAppearance, setSubtitleAppearanceState] =
+    useState<SubtitleAppearance>(initialSubtitleAppearance);
 
   const hlsState = useHls({
     manifestUrl,
     videoRef,
+    originalResolution,
     onError,
     onReady: () => {
       const video = videoRef.current;
@@ -150,6 +178,101 @@ export function PlayerProvider({
     setIsMuted(video.muted);
   }, []);
 
+  const setSubtitleAppearance = useCallback(
+    (nextAppearance: Partial<SubtitleAppearance>) => {
+      setSubtitleAppearanceState((current) => ({
+        ...current,
+        ...nextAppearance,
+      }));
+    },
+    []
+  );
+
+  const resetSubtitleAppearance = useCallback(() => {
+    setSubtitleAppearanceState(defaultSubtitleAppearance);
+  }, []);
+
+  useEffect(() => {
+    try {
+      window.localStorage.setItem(
+        subtitleAppearanceStorageKey,
+        JSON.stringify(subtitleAppearance)
+      );
+    } catch {
+      // Styling is still usable when browser storage is unavailable.
+    }
+
+    const video = videoRef.current;
+    if (!video) return;
+    const background = {
+      transparent: 'transparent',
+      shadow: 'rgba(0, 0, 0, 0.58)',
+      solid: 'rgba(0, 0, 0, 0.9)',
+    }[subtitleAppearance.background];
+    const fontSize = {
+      small: '80%',
+      medium: '100%',
+      large: '125%',
+    }[subtitleAppearance.fontSize];
+    const cueLine = {
+      bottom: 88,
+      middle: 50,
+      top: 12,
+    }[subtitleAppearance.position];
+
+    video.style.setProperty('--subtitle-color', subtitleAppearance.color);
+    video.style.setProperty('--subtitle-background', background);
+    video.style.setProperty('--subtitle-font-size', fontSize);
+
+    const placeCue = (cue: VTTCue) => {
+      cue.snapToLines = false;
+      cue.line = cueLine;
+      cue.lineAlign = 'center';
+      cue.position = 50;
+      cue.positionAlign = 'center';
+    };
+    const placeTrackCues = (track: TextTrack) => {
+      for (const rawCue of Array.from(track.cues || [])) {
+        placeCue(rawCue as VTTCue);
+      }
+    };
+    const placeKnownCues = () => {
+      for (const track of Array.from(video.textTracks)) {
+        placeTrackCues(track);
+      }
+    };
+    const cleanupTrackListeners: Array<() => void> = [];
+    const listenToTrack = (track: TextTrack) => {
+      const handleCueChange = () => placeTrackCues(track);
+      placeTrackCues(track);
+      // A cuechange is dispatched as a subtitle becomes active.  This keeps
+      // its coordinates in place before the browser paints it, unlike the
+      // old timeupdate handler which visibly moved an already shown cue.
+      track.addEventListener('cuechange', handleCueChange);
+      cleanupTrackListeners.push(() =>
+        track.removeEventListener('cuechange', handleCueChange)
+      );
+    };
+    const handleAddTrack = (event: TrackEvent) => {
+      if (event.track) {
+        listenToTrack(event.track);
+      }
+    };
+
+    for (const track of Array.from(video.textTracks)) {
+      listenToTrack(track);
+    }
+    placeKnownCues();
+    video.textTracks.addEventListener('addtrack', handleAddTrack);
+    video.addEventListener('loadedmetadata', placeKnownCues);
+
+    return () => {
+      video.textTracks.removeEventListener('addtrack', handleAddTrack);
+      video.removeEventListener('loadedmetadata', placeKnownCues);
+      cleanupTrackListeners.forEach((cleanup) => cleanup());
+    };
+  }, [subtitleAppearance]);
+
   const changeVolumeRelative = useCallback(
     (delta: number) => {
       setVolume(volume + delta);
@@ -227,6 +350,9 @@ export function PlayerProvider({
       toggleMute,
       changeVolumeRelative,
       toggleFullscreen,
+      subtitleAppearance,
+      setSubtitleAppearance,
+      resetSubtitleAppearance,
       formattedCurrentTime: formatDuration(currentTime),
       formattedDuration: formatDuration(duration),
       progressPercent: duration ? (currentTime / duration) * 100 : 0,
@@ -250,6 +376,9 @@ export function PlayerProvider({
       toggleMute,
       changeVolumeRelative,
       toggleFullscreen,
+      subtitleAppearance,
+      setSubtitleAppearance,
+      resetSubtitleAppearance,
     ]
   );
 

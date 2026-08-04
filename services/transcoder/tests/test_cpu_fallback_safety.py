@@ -9,7 +9,7 @@ from unittest.mock import Mock, patch
 
 from pydantic import ValidationError
 
-from app import ffmpeg_utils, models
+from app import ffmpeg_utils, models, progress
 from app.config import Settings
 from app.tasks import pipeline
 from app.tasks import transcode_video as transcode_tasks
@@ -81,6 +81,90 @@ class _Heartbeat:
 
 
 class CPUFallbackSafetyTests(unittest.TestCase):
+    @staticmethod
+    def _chunk_result(index, *heights):
+        return {
+            "job_id": "job-1",
+            "chunk_index": index,
+            "renditions": [
+                {
+                    "height": height,
+                    "width": 1280 if height == 720 else 854,
+                    "bitrate": 3_000_000 if height == 720 else 1_500_000,
+                    "codec": "h264",
+                    "dir": f"/work/chunks/{index}/{height}",
+                }
+                for height in heights
+            ],
+        }
+
+    def test_concat_contract_accepts_each_planned_index_once(self):
+        settings = progress.with_chunked_tasks(
+            {},
+            ["transcode_720p", "transcode_480p"],
+            2,
+        )
+        by_height, metadata = transcode_tasks._validated_chunk_results(
+            [
+                self._chunk_result(0, 720, 480),
+                self._chunk_result(1, 720, 480),
+            ],
+            "job-1",
+            settings,
+        )
+
+        self.assertEqual(
+            [index for index, _rendition in by_height[720]],
+            [0, 1],
+        )
+        self.assertEqual(metadata[480]["codec"], "h264")
+
+    def test_concat_contract_rejects_missing_planned_index(self):
+        settings = progress.with_chunked_tasks(
+            {},
+            ["transcode_720p"],
+            2,
+        )
+
+        with self.assertRaisesRegex(ValueError, "cardinality mismatch"):
+            transcode_tasks._validated_chunk_results(
+                [self._chunk_result(0, 720)],
+                "job-1",
+                settings,
+            )
+
+    def test_concat_contract_rejects_duplicate_or_malformed_results(self):
+        settings = progress.with_chunked_tasks(
+            {},
+            ["transcode_720p"],
+            2,
+        )
+        with self.assertRaisesRegex(ValueError, "duplicate"):
+            transcode_tasks._validated_chunk_results(
+                [
+                    self._chunk_result(0, 720),
+                    self._chunk_result(0, 720),
+                ],
+                "job-1",
+                settings,
+            )
+        with self.assertRaisesRegex(ValueError, "malformed"):
+            transcode_tasks._validated_chunk_results(
+                [None],
+                "job-1",
+                settings,
+            )
+
+    def test_effective_fps_uses_measured_wall_time(self):
+        self.assertAlmostEqual(
+            transcode_tasks._effective_fps(24.0, 120.0, 10.0),
+            288.0,
+        )
+        self.assertEqual(
+            transcode_tasks._effective_fps(24.0, 120.0, 0.0),
+            0.0,
+        )
+
     def test_no_gpu_four_rung_movie_plan_is_capacity_bounded(self):
         groups, chunks = pipeline._cpu_fallback_plan(
             7177.832,
@@ -118,14 +202,56 @@ class CPUFallbackSafetyTests(unittest.TestCase):
         ]
 
         self.assertEqual(len(chunk_signatures), 240)
+        expected_chunk_totals = {
+            "transcode_360p": 60,
+            "transcode_480p": 60,
+            "transcode_720p": 60,
+            "transcode_1080p": 60,
+        }
         for signature in chunk_signatures:
             self.assertEqual(signature.options.get("queue"), "video_cpu")
             self.assertEqual(len(signature.args[2]), 1)
             self.assertGreater(signature.args[4], 0)
             self.assertLessEqual(signature.args[4], 120)
+            self.assertEqual(
+                signature.args[7][progress.CHUNK_TOTALS_SETTING],
+                expected_chunk_totals,
+            )
             self.assertTrue(signature.args[8])
         self.assertEqual(canvas.body.task, transcode_tasks.concat_segments.name)
         self.assertEqual(canvas.body.options.get("queue"), "package")
+
+    def test_long_gpu_replacement_configures_one_aggregate_per_rendition(self):
+        with patch.object(
+            transcode_tasks.progress_tracker,
+            "configure_chunked_task",
+        ) as configure:
+            transcode_tasks._bounded_cpu_group_canvas(
+                "job-1",
+                "minio://uploads/source.mkv",
+                FOUR_RUNGS,
+                7177.832,
+                {"cpu_fallback_chunk_duration_sec": 120},
+                video_id="video-1",
+            )
+
+        configured = {
+            (
+                call.args[1],
+                call.args[2],
+                call.kwargs["job_id"],
+            )
+            for call in configure.call_args_list
+        }
+        self.assertEqual(
+            configured,
+            {
+                ("transcode_360p", 60, "job-1"),
+                ("transcode_480p", 60, "job-1"),
+                ("transcode_720p", 60, "job-1"),
+                ("transcode_1080p", 60, "job-1"),
+            },
+        )
 
     def test_group_gpu_failure_never_runs_feature_length_cpu_inside_task(self):
         job_id = "job-gpu-loss"
@@ -224,6 +350,7 @@ class CPUFallbackSafetyTests(unittest.TestCase):
                     )
 
         self.assertAlmostEqual(raised.exception.duration, 7177.832)
+        self.assertEqual(raised.exception.video_id, video_id)
         multi_command.assert_called_once()
         self.assertTrue(multi_command.call_args.kwargs["require_gpu"])
         self.assertEqual(run.call_args.kwargs["wall_timeout"], 5400)
@@ -301,6 +428,11 @@ class CPUFallbackSafetyTests(unittest.TestCase):
         self.assertEqual(command[threads_index + 1], "2")
         filter_threads_index = command.index("-filter_complex_threads")
         self.assertEqual(command[filter_threads_index + 1], "2")
+        self.assertLess(
+            command.index("-t"),
+            command.index("-i"),
+            "chunk duration must be input-scoped for every rendition",
+        )
         with self.assertRaises(ValidationError):
             Settings(_env_file=None, CPU_VIDEO_PRESET="p6")
 

@@ -1,24 +1,68 @@
 # syntax=docker/dockerfile:1
-# Extends the shared transcoder base Dockerfile with NVIDIA runtime configuration.
-# Builds directly from the source context — no pre-built base image required.
-ARG BASE_IMAGE=python:3.11.15-slim
+
+# Keep the application runtime identical to the CPU image while pinning the
+# base manifest used to build the validated linux/amd64 image.
+ARG BASE_IMAGE=python:3.11.15-slim@sha256:db3ff2e1800a8581e2c48a27c3995339d47bdf046da21c7627accd3d51053a93
+
+# Build FFmpeg from its official release archive in the same Debian generation
+# as the runtime image. This avoids mixing Ubuntu/CUDA image libraries into the
+# Python worker. The build does not enable FFmpeg's nonfree flag, but the
+# enabled x264/x265 integrations make the resulting FFmpeg binary GPL. See the
+# third-party notice copied into the final image.
+FROM ${BASE_IMAGE} AS ffmpeg-builder
+
+ARG FFMPEG_VERSION=8.1.2
+ARG FFMPEG_SHA256=464beb5e7bf0c311e68b45ae2f04e9cc2af88851abb4082231742a74d97b524c
+ARG FFMPEG_BUILD_JOBS=4
+ARG SOURCE_DATE_EPOCH=1781675220
+
+ENV DEBIAN_FRONTEND=noninteractive
+
+RUN sed -i 's/^Types: deb$/Types: deb deb-src/' /etc/apt/sources.list.d/debian.sources && \
+    apt-get update && \
+    apt-get install -y --no-install-recommends \
+      ca-certificates \
+      curl \
+      dpkg-dev \
+      xz-utils \
+    && apt-get build-dep -y --no-install-recommends ffmpeg \
+    && rm -rf /var/lib/apt/lists/*
+
+COPY build-ffmpeg.sh /usr/local/src/build-ffmpeg.sh
+RUN chmod +x /usr/local/src/build-ffmpeg.sh && \
+    FFMPEG_VERSION="${FFMPEG_VERSION}" \
+    FFMPEG_SHA256="${FFMPEG_SHA256}" \
+    FFMPEG_BUILD_JOBS="${FFMPEG_BUILD_JOBS}" \
+    SOURCE_DATE_EPOCH="${SOURCE_DATE_EPOCH}" \
+    /usr/local/src/build-ffmpeg.sh
+
 FROM ${BASE_IMAGE}
 
-# Install FFmpeg. NVENC driver/CUDA libraries are injected at runtime by the
-# NVIDIA Container Toolkit (deploy.resources.reservations.devices) and the
-# /usr/lib/wsl/lib bind mount — no host-driver apt packages are needed in the image.
+LABEL org.opencontainers.image.source="https://github.com/X-DIABLO-X/HLS-ENGINE" \
+      org.opencontainers.image.licenses="GPL-2.0-or-later"
+
+# The Debian FFmpeg package supplies the same broad set of runtime codec
+# libraries used by the existing worker. The version-pinned FFmpeg 8.1
+# executables built above take precedence in /usr/local/bin.
 RUN apt-get update && \
     apt-get install -y --no-install-recommends \
       ffmpeg \
       wget \
     && rm -rf /var/lib/apt/lists/*
 
-# NVIDIA Container Toolkit runtime configuration
+COPY --from=ffmpeg-builder /opt/ffmpeg/bin/ffmpeg /usr/local/bin/ffmpeg
+COPY --from=ffmpeg-builder /opt/ffmpeg/bin/ffprobe /usr/local/bin/ffprobe
+COPY THIRD_PARTY_NOTICES.md /usr/share/doc/hls-engine/THIRD_PARTY_NOTICES.md
+
+# NVIDIA driver libraries are injected at runtime by the NVIDIA Container
+# Toolkit. WSL2 deployments additionally bind /usr/lib/wsl/lib via Compose.
 ENV NVIDIA_VISIBLE_DEVICES=all
 ENV NVIDIA_DRIVER_CAPABILITIES=compute,video,utility
 
-# Ensure FFmpeg can find NVENC encoders
-RUN ffmpeg -encoders | grep -q h264_nvenc || (echo "FFmpeg NVENC support check failed" && exit 1)
+# Fail the image build if either NVENC registration or CUDA scaling was lost.
+RUN ffmpeg -hide_banner -version | grep -q '^ffmpeg version 8\.1\.2' && \
+    ffmpeg -hide_banner -encoders 2>/dev/null | grep -q 'h264_nvenc' && \
+    ffmpeg -hide_banner -filters 2>/dev/null | grep -q 'scale_cuda'
 
 WORKDIR /app
 

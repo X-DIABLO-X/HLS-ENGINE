@@ -18,7 +18,7 @@ export function VideoElement({ poster, title }: VideoElementProps) {
       controls={false}
       preload="metadata"
       crossOrigin="anonymous"
-      className="h-full w-full object-contain"
+      className="subtitle-video h-full w-full object-contain"
       aria-label={title || 'Video player'}
       onClick={togglePlay}
     />

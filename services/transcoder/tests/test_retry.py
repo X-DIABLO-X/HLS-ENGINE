@@ -144,5 +144,78 @@ class RetryEndpointTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(delay.call_args.kwargs["source_url"], source_url)
 
 
+class SubmitEndpointTests(unittest.IsolatedAsyncioTestCase):
+    async def test_submit_snapshots_defaults_before_publishing(self):
+        session = Mock()
+        snapshot = {
+            "qualities": [1080, 720],
+            "chunked_encoding": True,
+            "video_passthrough_enabled": False,
+        }
+        request = main.SubmitJobRequest(
+            source_url="minio://uploads-raw/source.mkv",
+        )
+
+        with (
+            patch.object(main, "SessionLocal", return_value=session),
+            patch.object(
+                progress,
+                "get_default_settings",
+                return_value=snapshot,
+            ) as get_defaults,
+            patch.object(pipeline.run_pipeline, "delay") as delay,
+            patch.object(main, "transcode_jobs_total") as jobs_total,
+        ):
+            jobs_total.labels.return_value = jobs_total
+            result = await main.submit_job(request)
+
+        self.assertEqual(result["status"], "submitted")
+        get_defaults.assert_called_once_with()
+        self.assertEqual(delay.call_args.kwargs["settings"], snapshot)
+        self.assertEqual(session.add.call_count, 2)
+        session.commit.assert_called_once_with()
+        session.close.assert_called_once_with()
+
+
+class PipelineSettingsSnapshotTests(unittest.TestCase):
+    def test_worker_refuses_to_resolve_mutable_defaults(self):
+        with (
+            patch.object(
+                pipeline.progress_tracker,
+                "get_default_settings",
+            ) as get_defaults,
+            self.assertRaisesRegex(
+                ValueError,
+                "settings snapshot is required",
+            ),
+        ):
+            pipeline._run_pipeline(
+                Mock(),
+                "job-1",
+                "minio://uploads-raw/source.mkv",
+                "video-1",
+                settings=None,
+            )
+
+        get_defaults.assert_not_called()
+
+    def test_defaults_snapshot_includes_worker_only_media_switches(self):
+        redis_client = Mock()
+        redis_client.get.return_value = None
+        config = SimpleNamespace(
+            NVENC_PROFILE="balanced",
+            AAC_PASSTHROUGH_ENABLED=True,
+        )
+
+        with (
+            patch("app.config.get_settings", return_value=config),
+            patch.object(progress, "_redis", return_value=redis_client),
+        ):
+            snapshot = progress.get_default_settings()
+
+        self.assertEqual(snapshot["nvenc_profile"], "balanced")
+        self.assertTrue(snapshot["aac_passthrough_enabled"])
+
+
 if __name__ == "__main__":
     unittest.main()

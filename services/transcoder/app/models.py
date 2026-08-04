@@ -19,6 +19,27 @@ _LANGUAGE_TAG_RE = re.compile(r"^[A-Za-z0-9]{1,8}(?:-[A-Za-z0-9]{1,8})*$")
 _PATH_TOKEN_RE = re.compile(r"[^a-z0-9]+")
 _TRACK_ID_RE = re.compile(r"^[a-z0-9]+(?:_[a-z0-9]+)*$")
 
+_LANGUAGE_DISPLAY_NAMES = {
+    "ara": "Arabic",
+    "ben": "Bengali",
+    "deu": "German",
+    "eng": "English",
+    "fra": "French",
+    "hin": "Hindi",
+    "ind": "Indonesian",
+    "ita": "Italian",
+    "jpn": "Japanese",
+    "kor": "Korean",
+    "por": "Portuguese",
+    "rus": "Russian",
+    "spa": "Spanish",
+    "tam": "Tamil",
+    "tel": "Telugu",
+    "tha": "Thai",
+    "tur": "Turkish",
+    "und": "Unknown language",
+}
+
 
 def normalize_track_language(value: Any) -> str:
     """Return a safe, compact BCP-47-ish language tag for storage and HLS.
@@ -78,11 +99,15 @@ def suffixed_hls_name(value: Any, suffix: int) -> str:
 
 
 def track_display_name(info: Dict[str, Any], language: str, ordinal: int = 1) -> str:
-    tags = info.get("tags") if isinstance(info.get("tags"), dict) else {}
-    title = info.get("name") or info.get("title") or tags.get("title")
-    if title:
-        return hls_attribute(title)
-    base = normalize_track_language(language).upper()
+    """Return a viewer-facing language name, never an uploader title.
+
+    Container titles commonly contain release-group names such as
+    ``MoviesMod.army``. They are not useful playback labels and should not be
+    exposed in the player or the master playlist.
+    """
+    normalized = normalize_track_language(language)
+    primary = normalized.split("-", 1)[0]
+    base = _LANGUAGE_DISPLAY_NAMES.get(primary, primary.upper())
     return base if ordinal <= 1 else f"{base} {ordinal}"
 
 
@@ -176,6 +201,9 @@ class Video(Base):
     __tablename__ = "videos"
 
     id = Column(UUID(as_uuid=False), primary_key=True)
+    owner_user_id = Column(UUID(as_uuid=False), nullable=True)
+    share_id = Column(UUID(as_uuid=False), nullable=True)
+    share_enabled = Column(Boolean, nullable=False, default=False)
     source_url = Column(String, nullable=False)
     title = Column(String)
     status = Column(String, default="pending")
@@ -214,6 +242,7 @@ class Rendition(Base):
     video_id = Column(UUID(as_uuid=False), ForeignKey("videos.id", ondelete="CASCADE"), nullable=False)
 
     name = Column(String)
+    is_original = Column(Boolean, nullable=False, default=False)
     height = Column(Integer, nullable=False)
     width = Column(Integer)
     video_bitrate = Column(Integer)

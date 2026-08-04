@@ -4,7 +4,12 @@ import {
   UploadProgress,
   Video,
   VideoListResponse,
+  CatalogTitle,
+  Season,
+  Playable,
+  PlaybackNavigation,
   ProcessingProgress,
+  Rendition,
   TranscodingSettings,
 } from '@/types/video';
 import { useAuthStore } from '@/lib/auth';
@@ -77,6 +82,11 @@ export async function getVideo(id: string): Promise<Video> {
   return data;
 }
 
+export async function getRenditions(id: string): Promise<Rendition[]> {
+  const { data } = await api.get<Rendition[]>(`/videos/${id}/renditions`);
+  return data;
+}
+
 export async function getSignedManifest(
   videoId: string
 ): Promise<SignedUrlResponse> {
@@ -95,6 +105,60 @@ export async function getSignedManifest(
 export async function createVideo(title: string, description?: string): Promise<Video> {
   const { data } = await api.post<Video>('/videos', { title, description });
   return data;
+}
+
+export async function updateVideoShare(videoId: string, enabled: boolean, rotate = false) {
+  const { data } = await api.post<{ shareId?: string; enabled: boolean }>(`/videos/${videoId}/share`, { enabled, rotate });
+  return data;
+}
+
+export async function getCatalogTitles(type?: 'movie' | 'series'): Promise<CatalogTitle[]> {
+  const { data } = await api.get<{ titles: CatalogTitle[] }>('/catalog/titles', { params: type ? { type } : undefined });
+  return data.titles;
+}
+
+export async function getCatalogTitle(id: string): Promise<CatalogTitle> {
+  const { data } = await api.get<CatalogTitle>(`/catalog/titles/${id}`);
+  return data;
+}
+
+export async function createCatalogTitle(input: Partial<CatalogTitle> & Pick<CatalogTitle, 'type' | 'title'>): Promise<CatalogTitle> {
+  const { data } = await api.post<CatalogTitle>('/catalog/titles', input);
+  return data;
+}
+
+export async function getSeasons(titleId: string): Promise<Season[]> {
+  const { data } = await api.get<{ seasons: Season[] }>(`/catalog/titles/${titleId}/seasons`);
+  return data.seasons;
+}
+
+export async function createSeason(titleId: string, input: Pick<Season, 'seasonNumber'> & Partial<Season>): Promise<Season> {
+  const { data } = await api.post<Season>(`/catalog/titles/${titleId}/seasons`, input);
+  return data;
+}
+
+export async function getPlayables(titleId: string): Promise<Playable[]> {
+  const { data } = await api.get<{ playables: Playable[] }>(`/catalog/titles/${titleId}/playables`);
+  return data.playables;
+}
+
+export async function createPlayable(titleId: string, input: Omit<Playable, 'id' | 'titleId' | 'status' | 'shareId'>): Promise<Playable> {
+  const { data } = await api.post<Playable>(`/catalog/titles/${titleId}/playables`, input);
+  return data;
+}
+
+export async function setPlayablePublication(playableId: string, publish: boolean, rotate = false): Promise<Playable> {
+  const endpoint = publish ? (rotate ? 'share/rotate' : 'publish') : 'unpublish';
+  const { data } = await api.post<Playable>(`/catalog/playables/${playableId}/${endpoint}`);
+  return data;
+}
+
+export async function deletePlayable(playableId: string): Promise<void> {
+  await api.delete(`/catalog/playables/${playableId}`);
+}
+
+export async function deleteCatalogTitle(titleId: string): Promise<void> {
+  await api.delete(`/catalog/titles/${titleId}`);
 }
 
 export interface MultipartUploadSessionResponse {
@@ -317,13 +381,13 @@ export async function retryVideo(videoId: string): Promise<RetryJobResponse> {
  * token embedded in the URL is the only credential needed to fetch segments.
  */
 export interface EmbedManifestResponse {
-  id: string;
   title: string;
-  status: string;
-  duration?: number;
+  kind: 'movie' | 'episode' | 'standalone';
   url: string;
   token?: string;
   expiresAt?: string;
+  previous?: PlaybackNavigation;
+  next?: PlaybackNavigation;
 }
 
 const publicApi = axios.create({
@@ -332,9 +396,9 @@ const publicApi = axios.create({
   timeout: 15000,
 });
 
-export async function getEmbedManifest(videoId: string): Promise<EmbedManifestResponse> {
+export async function getEmbedManifest(shareId: string): Promise<EmbedManifestResponse> {
   const { data } = await publicApi.get<EmbedManifestResponse>(
-    `/videos/${videoId}/embed`
+    `/embed/${shareId}`
   );
   return data;
 }

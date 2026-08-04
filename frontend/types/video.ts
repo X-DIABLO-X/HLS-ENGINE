@@ -1,5 +1,9 @@
 export interface Rendition {
   id: string;
+  name?: string;
+  is_original?: boolean;
+  /** Set for the matching HLS level after the manifest is parsed. */
+  isOriginal?: boolean;
   width: number;
   height: number;
   bitrate: number;
@@ -27,6 +31,9 @@ export interface Subtitle {
 
 export interface Video {
   id: string;
+  ownerUserId?: string;
+  shareId?: string;
+  shareEnabled?: boolean;
   title: string;
   description?: string;
   status: 'uploading' | 'processing' | 'ready' | 'failed';
@@ -38,6 +45,53 @@ export interface Video {
   renditions?: Rendition[];
   audioTracks?: AudioTrack[];
   subtitles?: Subtitle[];
+}
+
+export type CatalogTitleType = 'movie' | 'series';
+export type CatalogStatus = 'draft' | 'published';
+
+export interface CatalogTitle {
+  id: string;
+  ownerUserId: string;
+  type: CatalogTitleType;
+  title: string;
+  synopsis?: string;
+  genres?: string[];
+  releaseDate?: string;
+  maturityRating?: string;
+  posterUrl?: string;
+  backdropUrl?: string;
+  status: CatalogStatus;
+  createdAt: string;
+  updatedAt: string;
+}
+
+export interface Season {
+  id: string;
+  seriesId: string;
+  seasonNumber: number;
+  title?: string;
+  synopsis?: string;
+  posterUrl?: string;
+}
+
+export interface Playable {
+  id: string;
+  titleId: string;
+  seasonId?: string;
+  videoId: string;
+  type: 'movie' | 'episode';
+  episodeNumber?: number;
+  title: string;
+  synopsis?: string;
+  artworkUrl?: string;
+  status: CatalogStatus;
+  shareId?: string;
+}
+
+export interface PlaybackNavigation {
+  title: string;
+  shareId: string;
 }
 
 export interface VideoListResponse {

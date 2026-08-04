@@ -1,6 +1,6 @@
 """SQLAlchemy engine, session and declarative base."""
 
-from sqlalchemy import create_engine
+from sqlalchemy import create_engine, text
 from sqlalchemy.orm import declarative_base, sessionmaker
 
 from app.config import get_settings
@@ -23,3 +23,13 @@ Base = declarative_base()
 
 def init_db() -> None:
     Base.metadata.create_all(bind=engine)
+    # ``create_all`` does not add fields to an existing table. Keep this
+    # additive migration local and idempotent until the project adopts a
+    # dedicated migration runner.
+    with engine.begin() as connection:
+        connection.execute(
+            text(
+                "ALTER TABLE renditions ADD COLUMN IF NOT EXISTS "
+                "is_original BOOLEAN NOT NULL DEFAULT FALSE"
+            )
+        )

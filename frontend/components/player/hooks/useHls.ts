@@ -1,10 +1,12 @@
 import { useEffect, useRef, useState } from 'react';
 import Hls, { Level, MediaPlaylist } from 'hls.js';
 import { AudioTrack, Rendition, Subtitle } from '@/types/video';
+import { displayLanguage } from '../language';
 
 export interface UseHlsOptions {
   manifestUrl: string;
   videoRef: React.RefObject<HTMLVideoElement | null>;
+  originalResolution?: { width: number; height: number };
   onError?: (error: Error) => void;
   onReady?: () => void;
 }
@@ -15,7 +17,10 @@ export interface UseHlsReturn {
   levels: Rendition[];
   audioTracks: AudioTrack[];
   subtitles: Subtitle[];
+  /** User's quality choice: -1 means adaptive (Auto). */
   currentLevel: number;
+  /** Rendition hls.js is actually decoding right now. */
+  activeLevel: number;
   currentAudioTrack: number;
   currentSubtitleTrack: number;
   setLevel: (level: number) => void;
@@ -23,7 +28,10 @@ export interface UseHlsReturn {
   setSubtitleTrack: (index: number) => void;
 }
 
-function mapRenditions(hlsLevels: Level[]): Rendition[] {
+function mapRenditions(
+  hlsLevels: Level[],
+  originalResolution?: { width: number; height: number }
+): Rendition[] {
   return hlsLevels.map((level, index) => ({
     id: `level-${index}`,
     width: level.width,
@@ -31,14 +39,18 @@ function mapRenditions(hlsLevels: Level[]): Rendition[] {
     bitrate: level.bitrate,
     codec: level.codecSet,
     frameRate: level.frameRate,
+    isOriginal:
+      originalResolution?.width === level.width &&
+      originalResolution.height === level.height,
   }));
 }
 
 function mapAudioTracks(tracks: MediaPlaylist[]): AudioTrack[] {
+  const seen = new Map<string, number>();
   return tracks.map((track, index) => ({
     id: `audio-${index}`,
     lang: track.lang || 'und',
-    name: track.name || `Track ${index + 1}`,
+    name: numberedLanguageName(track.lang, seen),
     default: track.default,
     autoselect: track.autoselect,
     forced: track.forced,
@@ -46,18 +58,41 @@ function mapAudioTracks(tracks: MediaPlaylist[]): AudioTrack[] {
 }
 
 function mapSubtitles(tracks: MediaPlaylist[]): Subtitle[] {
+  const seen = new Map<string, number>();
   return tracks.map((track, index) => ({
     id: `subtitle-${index}`,
     lang: track.lang || 'und',
-    name: track.name || `Subtitle ${index + 1}`,
+    name: numberedLanguageName(track.lang, seen),
     default: track.default,
     forced: track.forced,
   }));
 }
 
+function numberedLanguageName(
+  language: string | undefined,
+  seen: Map<string, number>
+): string {
+  const key = (language || 'und').toLowerCase();
+  const number = (seen.get(key) || 0) + 1;
+  seen.set(key, number);
+  const base = displayLanguage(language);
+  return number === 1 ? base : `${base} ${number}`;
+}
+
+function isSubtitleError(data: { details?: unknown; frag?: { type?: unknown } }): boolean {
+  return (
+    data.frag?.type === 'subtitle' ||
+    (typeof data.details === 'string' && data.details.toLowerCase().includes('subtitle'))
+  );
+}
+
 export function useHls(options: UseHlsOptions): UseHlsReturn {
-  const { manifestUrl, videoRef, onError, onReady } = options;
+  const { manifestUrl, videoRef, originalResolution, onError, onReady } = options;
   const hlsRef = useRef<Hls | null>(null);
+  // hls.js rebuilds its audio-track list when it parses or reloads a master
+  // playlist. Keep an explicit user choice outside React state so that a
+  // playlist refresh cannot silently put the player back on DEFAULT=YES.
+  const preferredAudioTrackRef = useRef<number | null>(null);
 
   // Keep callbacks in refs so they don't destroy/recreate the Hls instance
   // on every parent render.
@@ -74,7 +109,11 @@ export function useHls(options: UseHlsOptions): UseHlsReturn {
   const [levels, setLevels] = useState<Rendition[]>([]);
   const [audioTracks, setAudioTracks] = useState<AudioTrack[]>([]);
   const [subtitles, setSubtitles] = useState<Subtitle[]>([]);
+  // Keep the selected quality distinct from the rendition being decoded.
+  // In adaptive mode hls.js emits LEVEL_SWITCHED whenever it changes bitrate;
+  // using that event to set currentLevel made Auto look like a manual choice.
   const [currentLevel, setCurrentLevel] = useState(-1);
+  const [activeLevel, setActiveLevel] = useState(-1);
   const [currentAudioTrack, setCurrentAudioTrack] = useState(-1);
   const [currentSubtitleTrack, setCurrentSubtitleTrack] = useState(-1);
 
@@ -82,6 +121,7 @@ export function useHls(options: UseHlsOptions): UseHlsReturn {
     const video = videoRef.current;
     if (!video) return;
 
+    preferredAudioTrackRef.current = null;
     setIsLoading(true);
     setError(null);
 
@@ -101,16 +141,40 @@ export function useHls(options: UseHlsOptions): UseHlsReturn {
       });
 
       hls.on(Hls.Events.MANIFEST_PARSED, (_event, data) => {
-        setLevels(mapRenditions(data.levels));
-        setCurrentLevel(hls.nextLevel === -1 ? -1 : hls.nextLevel);
+        setLevels(mapRenditions(data.levels, originalResolution));
+        setCurrentLevel(-1);
+        setActiveLevel(hls.currentLevel);
         setAudioTracks(mapAudioTracks(hls.audioTracks));
-        setSubtitles(mapSubtitles(hls.subtitleTracks));
+        setCurrentAudioTrack(hls.audioTrack);
+        const subtitleTracks = hls.subtitleTracks;
+        const defaultSubtitleTrack = subtitleTracks.findIndex(
+          (track) => track.default
+        );
+        // hls.js leaves subtitles off unless instructed otherwise on some
+        // browsers. Honour the manifest's DEFAULT=YES selection explicitly.
+        if (defaultSubtitleTrack >= 0) {
+          hls.subtitleTrack = defaultSubtitleTrack;
+          setCurrentSubtitleTrack(defaultSubtitleTrack);
+        }
+        setSubtitles(mapSubtitles(subtitleTracks));
         setIsLoading(false);
         onReadyRef.current?.();
       });
 
       hls.on(Hls.Events.AUDIO_TRACKS_UPDATED, (_event, data) => {
         setAudioTracks(mapAudioTracks(data.audioTracks));
+
+        const preferredTrack = preferredAudioTrackRef.current;
+        if (
+          preferredTrack !== null &&
+          preferredTrack >= 0 &&
+          preferredTrack < data.audioTracks.length &&
+          hls.audioTrack !== preferredTrack
+        ) {
+          // A source reload selects the manifest default before it emits this
+          // event. Restore the track selected from the settings menu.
+          hls.audioTrack = preferredTrack;
+        }
       });
 
       hls.on(Hls.Events.SUBTITLE_TRACKS_UPDATED, (_event, data) => {
@@ -118,7 +182,7 @@ export function useHls(options: UseHlsOptions): UseHlsReturn {
       });
 
       hls.on(Hls.Events.LEVEL_SWITCHED, (_event, data) => {
-        setCurrentLevel(data.level);
+        setActiveLevel(data.level);
       });
 
       hls.on(Hls.Events.AUDIO_TRACK_SWITCHED, (_event, data) => {
@@ -130,6 +194,14 @@ export function useHls(options: UseHlsOptions): UseHlsReturn {
       });
 
       hls.on(Hls.Events.ERROR, (_event, data) => {
+        // Subtitle playlists are optional. A bad or expired subtitle request
+        // must never turn a healthy A/V session into a fatal player error.
+        if (isSubtitleError(data)) {
+          hls.subtitleTrack = -1;
+          setCurrentSubtitleTrack(-1);
+          console.warn('Subtitle track was disabled after a loading error', data);
+          return;
+        }
         if (data.fatal) {
           let message = 'HLS playback error';
           switch (data.type) {
@@ -178,7 +250,7 @@ export function useHls(options: UseHlsOptions): UseHlsReturn {
       hls?.destroy();
       hlsRef.current = null;
     };
-  }, [manifestUrl, videoRef]);
+  }, [manifestUrl, originalResolution, videoRef]);
 
   const setLevel = (level: number) => {
     const hls = hlsRef.current;
@@ -189,7 +261,8 @@ export function useHls(options: UseHlsOptions): UseHlsReturn {
 
   const setAudioTrack = (index: number) => {
     const hls = hlsRef.current;
-    if (!hls) return;
+    if (!hls || index < 0 || index >= hls.audioTracks.length) return;
+    preferredAudioTrackRef.current = index;
     hls.audioTrack = index;
     setCurrentAudioTrack(index);
   };
@@ -208,6 +281,7 @@ export function useHls(options: UseHlsOptions): UseHlsReturn {
     audioTracks,
     subtitles,
     currentLevel,
+    activeLevel,
     currentAudioTrack,
     currentSubtitleTrack,
     setLevel,

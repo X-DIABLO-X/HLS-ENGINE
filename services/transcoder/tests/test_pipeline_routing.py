@@ -8,6 +8,7 @@ from app.tasks.pipeline import (
     _adaptive_chunk_duration,
     _build_chunks,
     _live_gpu_indices,
+    _with_mandatory_original,
     _partition_gpu_groups,
     _video_queue,
     on_pipeline_failure,
@@ -15,6 +16,43 @@ from app.tasks.pipeline import (
 
 
 class PipelineRoutingTests(unittest.TestCase):
+    def test_cinematic_source_keeps_original_when_1080p_is_above_source(self):
+        original, adaptive = _with_mandatory_original(
+            [
+                {"height": 720, "width": 1280, "bitrate": 3_000_000},
+                {"height": 480, "width": 854, "bitrate": 1_500_000},
+            ],
+            {
+                "width": 1920,
+                "height": 804,
+                "video_bitrate": 4_000_000,
+                "video_profile": "High",
+                "video_level": 40,
+            },
+            True,
+        )
+
+        self.assertEqual(original["name"], "Original")
+        self.assertTrue(original["is_original"])
+        self.assertTrue(original["direct_play"])
+        self.assertEqual((original["width"], original["height"]), (1920, 804))
+        self.assertEqual([item["height"] for item in adaptive], [720, 480])
+
+    def test_source_height_rung_is_deduplicated_by_original(self):
+        original, adaptive = _with_mandatory_original(
+            [
+                {"height": 1080, "width": 1920, "bitrate": 6_000_000},
+                {"height": 720, "width": 1280, "bitrate": 3_000_000},
+                {"height": 480, "width": 854, "bitrate": 1_500_000},
+            ],
+            {"width": 1920, "height": 1080, "video_bitrate": 5_000_000},
+            False,
+        )
+
+        self.assertEqual(original["height"], 1080)
+        self.assertFalse(original["direct_play"])
+        self.assertEqual([item["height"] for item in adaptive], [720, 480])
+
     def test_live_gpu_workers_select_gpu_queue(self):
         status = [
             {"index": 0, "worker_id": "gpu-a"},

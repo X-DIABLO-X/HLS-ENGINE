@@ -19,6 +19,7 @@ CREATE TABLE IF NOT EXISTS renditions (
     id UUID PRIMARY KEY,
     video_id UUID NOT NULL REFERENCES videos(id) ON DELETE CASCADE,
     name VARCHAR(255) NOT NULL,
+    is_original BOOLEAN NOT NULL DEFAULT FALSE,
     codec VARCHAR(100),
     bandwidth INTEGER NOT NULL,
     width INTEGER,

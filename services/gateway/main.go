@@ -32,6 +32,8 @@ func main() {
 	registry, err := proxy.NewRegistry(map[string]string{
 		"/api/v1/auth/":                getEnv("AUTH_SERVICE_URL", "http://auth:8080"),
 		"/api/v1/videos":               getEnv("METADATA_SERVICE_URL", "http://metadata:8080"),
+		"/api/v1/catalog/":             getEnv("METADATA_SERVICE_URL", "http://metadata:8080"),
+		"/api/v1/embed/":               getEnv("METADATA_SERVICE_URL", "http://metadata:8080"),
 		"/api/v1/transcoding-settings": getEnv("METADATA_SERVICE_URL", "http://metadata:8080"),
 		"/api/v1/upload/":              getEnv("UPLOAD_SERVICE_URL", "http://upload:8080"),
 		"/api/v1/analytics/":           getEnv("ANALYTICS_SERVICE_URL", "http://analytics:8080"),
@@ -54,10 +56,8 @@ func main() {
 	// Public auth proxy
 	r.Handle("/api/v1/auth/*", http.HandlerFunc(registry.Handler))
 
-	// Public embed manifest: lets third-party sites embed the player via
-	// <iframe src="/embed/{id}"> without a user session. The signed token
-	// returned by the endpoint is the only credential needed for HLS.
-	r.Get("/api/v1/videos/{id}/embed", http.HandlerFunc(registry.Handler))
+	// Public embeds are capabilities addressed by opaque, revocable share IDs.
+	r.Get("/api/v1/embed/{shareID}", http.HandlerFunc(registry.Handler))
 
 	// Upload routes go to upload service
 	uploadProxy := httputil.NewSingleHostReverseProxy(mustParseURL(getEnv("UPLOAD_SERVICE_URL", "http://upload:8080")))
@@ -102,6 +102,8 @@ func main() {
 		protected.Post("/api/v1/videos/{id}/subtitles", http.HandlerFunc(registry.Handler))
 		protected.Get("/api/v1/videos/{id}/subtitles", http.HandlerFunc(registry.Handler))
 		protected.Get("/api/v1/videos/{id}/progress", http.HandlerFunc(registry.Handler))
+		protected.Post("/api/v1/videos/{id}/share", http.HandlerFunc(registry.Handler))
+		protected.Handle("/api/v1/catalog/*", http.HandlerFunc(registry.Handler))
 		protected.Post("/api/v1/videos/{id}/retry", proxyHandler(transcoderProxy))
 		protected.Get("/api/v1/transcoding-settings", http.HandlerFunc(registry.Handler))
 		protected.Put("/api/v1/transcoding-settings", http.HandlerFunc(registry.Handler))
@@ -162,6 +164,11 @@ func readyHandler(log *zerolog.Logger) http.HandlerFunc {
 func authMiddleware(jm *jwt.Manager, apiKeyHeader string, log *zerolog.Logger) func(http.Handler) http.Handler {
 	return func(next http.Handler) http.Handler {
 		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			// Identity headers are an internal trust boundary. Never allow a
+			// client to smuggle another creator's identity to an upstream.
+			r.Header.Del("X-Authenticated-User-ID")
+			r.Header.Del("X-Authenticated-Role")
+			r.Header.Del("X-Authenticated-API-Key")
 			authHeader := r.Header.Get("Authorization")
 			apiKey := r.Header.Get(apiKeyHeader)
 
@@ -180,6 +187,8 @@ func authMiddleware(jm *jwt.Manager, apiKeyHeader string, log *zerolog.Logger) f
 					http.Error(w, `{"error":"invalid token type"}`, http.StatusUnauthorized)
 					return
 				}
+				r.Header.Set("X-Authenticated-User-ID", claims.UserID)
+				r.Header.Set("X-Authenticated-Role", claims.Role)
 				ctx := context.WithValue(r.Context(), "claims", claims)
 				next.ServeHTTP(w, r.WithContext(ctx))
 				return
@@ -191,6 +200,7 @@ func authMiddleware(jm *jwt.Manager, apiKeyHeader string, log *zerolog.Logger) f
 					http.Error(w, `{"error":"invalid api key"}`, http.StatusUnauthorized)
 					return
 				}
+				r.Header.Set("X-Authenticated-API-Key", "true")
 				next.ServeHTTP(w, r)
 				return
 			}

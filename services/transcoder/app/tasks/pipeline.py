@@ -4,7 +4,7 @@ import logging
 import uuid
 from datetime import datetime, timezone
 
-from celery import chord, group
+from celery import Task, chord, group
 
 from app.celery_app import celery_app
 from app.config import get_settings
@@ -34,6 +34,7 @@ from app.tasks.probe import _run_probe
 from app.tasks.thumbnail import thumbnail
 from app.tasks.workspace_cleanup import request_workspace_cleanup
 from app.tasks.transcode_video import (
+    DIRECT_PLAY_PENDING,
     transcode_video,
     transcode_group,
     transcode_chunk,
@@ -79,6 +80,38 @@ def _run_probe_sync(job_id: str, source_url: str) -> dict:
 def _rendition_height(rendition) -> int:
     """Heights from int or dict rendition specs."""
     return rendition if isinstance(rendition, int) else rendition.get("height", 0)
+
+
+def _with_mandatory_original(
+    renditions: list,
+    probe_result: dict,
+    direct_play_eligible: bool,
+) -> tuple[dict, list]:
+    """Return the source-native Original track plus non-colliding ABR rungs."""
+    source_height = int(probe_result.get("height") or 0)
+    source_width = int(probe_result.get("width") or 0)
+    if source_height <= 0 or source_width <= 0:
+        raise ValueError("Original rendition requires valid source dimensions")
+    original = {
+        "name": "Original",
+        "is_original": True,
+        "height": source_height,
+        "width": source_width,
+        "bitrate": max(200_000, int(probe_result.get("video_bitrate") or 0)),
+        "codec": "h264",
+        "direct_play": bool(direct_play_eligible),
+        "profile": probe_result.get("video_profile"),
+        "level": probe_result.get("video_level"),
+    }
+    # The storage and durable row identity are height-based. A selected rung
+    # at the source height is covered by Original and must not create a second
+    # rendition targeting the same canonical HLS directory.
+    adaptive = [
+        rendition
+        for rendition in renditions
+        if _rendition_height(rendition) != source_height
+    ]
+    return original, adaptive
 
 
 def _partition_groups(renditions: list, gpu_count: int) -> list:
@@ -236,7 +269,15 @@ def _run_pipeline(
     """Probe source, analyze per-title complexity, build a ladder, then fan out
     GPU-grouped transcode tasks (or chunked transcode + concat) in parallel with
     audio/subtitle/thumbnail, finishing with a packaging callback."""
-    settings = settings or progress_tracker.get_default_settings()
+    if not isinstance(settings, dict):
+        raise ValueError(
+            "pipeline settings snapshot is required; resolve defaults before "
+            "publishing run_pipeline"
+        )
+    # Never consult mutable defaults during task execution. Celery autoretries
+    # retain this serialized snapshot, so one job generation cannot change its
+    # ladder, chunking, or direct-play mode between dispatch attempts.
+    settings = dict(settings)
     codec = settings.get("codec", "h264")
     per_title = settings.get("per_title_encoding", True)
     chunked = settings.get("chunked_encoding", False)
@@ -279,21 +320,54 @@ def _run_pipeline(
     probe_result = _run_probe_sync(job_id, source_url)
 
     duration = probe_result.get("duration") or 0.0
+    video_duration = probe_result.get("video_duration") or duration
+    # Carry the video elementary-stream duration through the Celery graph.
+    # Containers can legitimately have a longer audio tail; video validation
+    # and chunk planning must not mistake that tail for missing frames.
+    settings = dict(settings)
+    settings["_source_video_duration"] = float(video_duration)
     src_height = probe_result.get("height") or 1080
     src_width = probe_result.get("width") or 1920
+    direct_play_requested = bool(
+        settings.get("video_passthrough_enabled", False)
+    )
+    original_direct_play_eligible, direct_play_reason = (
+        ffmpeg_utils.h264_direct_play_eligibility(probe_result, codec)
+    )
+    direct_play_eligible = original_direct_play_eligible
+    # The former all-ladder passthrough mode is intentionally not selected for
+    # new deliveries: it would publish only the source rendition and omit the
+    # requested ABR ladder.  Compatibility now applies to Original alone;
+    # every delivery still schedules the selected encoded variants alongside it.
+    direct_play = False
+    if direct_play_requested:
+        logger.info(
+            "[pipeline] Original-only H.264 stream-copy job=%s eligible=%s reason=%s",
+            job_id,
+            original_direct_play_eligible,
+            direct_play_reason,
+        )
 
     # Adaptive chunk duration: scale chunk size with video length to keep the
     # number of chunks bounded and reduce concat/overhead, while still enabling
     # parallelism for long movies.
-    use_chunked = bool(chunked) and duration > chunk_min and duration > 0
+    use_chunked = (
+        bool(chunked)
+        and video_duration > chunk_min
+        and video_duration > 0
+    )
+    chunks = []
     if use_chunked:
-        chunk_dur = _adaptive_chunk_duration(duration, base=float(chunk_dur))
-        chunks = _build_chunks(duration, chunk_dur)
+        chunk_dur = _adaptive_chunk_duration(
+            video_duration,
+            base=float(chunk_dur),
+        )
+        chunks = _build_chunks(video_duration, chunk_dur)
         logger.info(
             "[pipeline] adaptive chunk_dur=%.0f chunks=%d for duration=%.0f",
             chunk_dur,
             len(chunks),
-            duration,
+            video_duration,
         )
 
     # The shared WORK_DIR volume means the probe's downloaded source is reusable.
@@ -301,10 +375,35 @@ def _run_pipeline(
 
     qualities = settings.get("qualities", [1080, 720, 480])
 
-    # Per-title complexity analysis + ladder.
-    if per_title:
+    # Direct play skips the content-analysis pass. Its encoded fallback uses
+    # the normal configured ladder at neutral complexity.
+    if direct_play:
+        complexity = 0.5
         try:
-            complexity = ffmpeg_utils.analyze_complexity(local_source, duration)
+            ladder = ffmpeg_utils.get_per_title_ladder(
+                src_height,
+                src_width,
+                qualities,
+                complexity,
+                codec,
+            )
+        except Exception as exc:
+            logger.warning(
+                "[pipeline] direct-play fallback ladder failed; using "
+                "the default ladder: %s",
+                exc,
+            )
+            ladder = ffmpeg_utils.get_ladder_for_qualities(
+                src_height,
+                src_width,
+                qualities,
+            )
+    elif per_title:
+        try:
+            complexity = ffmpeg_utils.analyze_complexity(
+                local_source,
+                video_duration,
+            )
         except Exception as exc:
             logger.warning("[pipeline] complexity analysis failed for job=%s: %s", job_id, exc)
             complexity = 0.5
@@ -320,7 +419,7 @@ def _run_pipeline(
         ladder = ffmpeg_utils.get_ladder_for_qualities(src_height, src_width, qualities)
 
     # Persist the per-title analysis + complexity score on the video row.
-    if per_title:
+    if per_title and not direct_play:
         try:
             db = SessionLocal()
             try:
@@ -355,8 +454,19 @@ def _run_pipeline(
         except Exception as exc:
             logger.warning("[pipeline] failed to persist PerTitleAnalysis: %s", exc)
 
-    # Caller-provided renditions override the computed ladder.
-    selected_renditions = renditions if renditions else ladder
+    # Caller-provided renditions override the computed ladder. The source
+    # rendition is published separately as the mandatory Original track; a
+    # numeric rung at the source height would collide with its HLS directory
+    # and provide no additional resolution, so Original owns that slot.
+    original_rendition, normal_renditions = _with_mandatory_original(
+        renditions if renditions else ladder,
+        probe_result,
+        direct_play_eligible,
+    )
+    if direct_play:
+        selected_renditions = [original_rendition]
+    else:
+        selected_renditions = [original_rendition, *normal_renditions]
 
     audio_infos = probe_result.get("audio_tracks", [])
     if audio_languages:
@@ -401,32 +511,115 @@ def _run_pipeline(
     live_gpu_indices = _live_gpu_indices(gpu_status)
     video_queue = _video_queue(live_gpu_indices)
     cpu_fallback_mode = not live_gpu_indices
-    if cpu_fallback_mode:
-        cpu_groups, chunks = _cpu_fallback_plan(
-            duration,
-            selected_renditions,
-            settings,
-        )
-        routed_groups = [(None, group_rend) for group_rend in cpu_groups]
-        # A CPU-only deployment must never fall through to the feature-length
-        # grouped task, regardless of the optional CHUNKED_ENCODING setting.
-        use_chunked = True
-        chunk_dur = max(length for _start, length in chunks)
+    if direct_play:
+        if cpu_fallback_mode:
+            fallback_groups, fallback_chunks = _cpu_fallback_plan(
+                video_duration,
+                normal_renditions,
+                settings,
+            )
+            fallback_routes = [
+                {"gpu_index": None, "renditions": group_rend}
+                for group_rend in fallback_groups
+            ]
+            fallback_use_chunked = True
+            fallback_queue = CPU_VIDEO_QUEUE
+            fallback_force_cpu = True
+        else:
+            if use_chunked:
+                validate_bounded_chunk_codecs(normal_renditions, codec)
+            fallback_routes = [
+                {
+                    "gpu_index": target_gpu,
+                    "renditions": group_rend,
+                }
+                for target_gpu, group_rend in _partition_gpu_groups(
+                    normal_renditions,
+                    gpu_status,
+                )
+            ]
+            fallback_chunks = chunks
+            fallback_use_chunked = use_chunked
+            fallback_queue = GPU_VIDEO_QUEUE
+            fallback_force_cpu = False
+
+        settings = dict(settings)
+        settings["chunked_encoding"] = False
+        settings["_video_direct_play"] = {
+            "probe": {
+                key: probe_result.get(key)
+                for key in (
+                    "duration",
+                    "video_duration",
+                    "width",
+                    "height",
+                    "video_codec",
+                    "video_profile",
+                    "video_level",
+                    "video_pix_fmt",
+                    "video_field_order",
+                    "video_sample_aspect_ratio",
+                    "video_rotation",
+                    "video_bitrate",
+                    "frame_rate",
+                )
+            },
+            "fallback_renditions": normal_renditions,
+            "fallback_routes": fallback_routes,
+            "fallback_chunks": fallback_chunks,
+            "fallback_use_chunked": fallback_use_chunked,
+            "fallback_queue": fallback_queue,
+            "fallback_force_cpu": fallback_force_cpu,
+        }
+        routed_groups = [(None, selected_renditions)]
+        # Remux is CPU-routed orchestration/I/O work and never acquires NVENC.
+        video_queue = CPU_VIDEO_QUEUE
+        cpu_fallback_mode = False
+        use_chunked = False
+    elif cpu_fallback_mode:
+        if normal_renditions:
+            cpu_groups, chunks = _cpu_fallback_plan(
+                video_duration,
+                normal_renditions,
+                settings,
+            )
+            routed_groups = [(None, group_rend) for group_rend in cpu_groups]
+            # A CPU-only deployment must never fall through to the feature-length
+            # grouped task, regardless of the optional CHUNKED_ENCODING setting.
+            use_chunked = True
+            chunk_dur = max(length for _start, length in chunks)
+        else:
+            routed_groups = []
+            chunks = []
+            use_chunked = False
     else:
-        if use_chunked:
+        if use_chunked and normal_renditions:
             validate_bounded_chunk_codecs(
-                selected_renditions,
+                normal_renditions,
                 codec,
             )
         routed_groups = _partition_gpu_groups(
-            selected_renditions,
+            normal_renditions,
             gpu_status,
+        )
+
+    rendition_task_names = [
+        f"transcode_{height}p"
+        for height in sorted(
+            {_rendition_height(r) for r in selected_renditions},
+            reverse=True,
+        )
+    ]
+    if use_chunked:
+        settings = progress_tracker.with_chunked_tasks(
+            settings,
+            rendition_task_names,
+            len(chunks),
         )
 
     # Progress task names: one per rendition height (deduped) + audio/subtitle/thumbnail/package.
     task_names = ["probe"]
-    for h in sorted({_rendition_height(r) for r in selected_renditions}, reverse=True):
-        task_names.append(f"transcode_{h}p")
+    task_names.extend(rendition_task_names)
     for audio in audio_infos:
         task_names.append(f"audio_{audio['track_id']}")
     for sub in subtitle_infos:
@@ -436,7 +629,12 @@ def _run_pipeline(
 
     db = SessionLocal()
     try:
-        lock_current_job(db, job_id)
+        _job, video = lock_current_job(db, job_id)
+        if direct_play:
+            # This generation-fenced row is the durable guard that prevents a
+            # delayed direct remux from promoting a source rung after another
+            # delivery has switched the job to the encoded fallback ladder.
+            video.encoding_strategy = DIRECT_PLAY_PENDING
         progress_tracker.init_progress(
             video_id,
             len(task_names),
@@ -448,6 +646,15 @@ def _run_pipeline(
             "probe",
             job_id=job_id,
         )
+        if use_chunked:
+            for task_name in rendition_task_names:
+                progress_tracker.configure_chunked_task(
+                    video_id,
+                    task_name,
+                    len(chunks),
+                    stage=f"Preparing {len(chunks)} video chunks",
+                    job_id=job_id,
+                )
         db.commit()
     finally:
         db.close()
@@ -483,6 +690,19 @@ def _run_pipeline(
                     settings,
                 ).set(queue=video_queue)
             )
+
+    if not direct_play:
+        # Original is independent from the adaptive ladder: it remuxes a
+        # compatible H.264 source and falls back to one source-size encode
+        # without suppressing the requested 720p/480p jobs.
+        header_sigs.append(
+            transcode_video.s(
+                job_id,
+                source_url,
+                original_rendition,
+                settings,
+            ).set(queue=video_queue)
+        )
 
     for audio in audio_infos:
         header_sigs.append(extract_audio.s(job_id, source_url, audio, settings))
@@ -548,8 +768,126 @@ def _run_pipeline(
     return {"job_id": job_id, "video_id": video_id, "status": "dispatched"}
 
 
+def _finalize_pipeline_failure(
+    video_id: str,
+    job_id: str,
+    *,
+    error_message: str,
+    cleanup_trigger: str,
+) -> None:
+    """Generation-fenced final failure shared by dispatch and chord tasks."""
+    db = SessionLocal()
+    try:
+        try:
+            job, video = lock_current_job(db, job_id, allow_completed=True)
+        except (StaleJobError, ValueError) as exc:
+            logger.info(
+                "[pipeline] ignoring delayed errback job=%s: %s",
+                job_id,
+                exc,
+            )
+            return
+        if (
+            job.status == models.JobStatus.completed.value
+            or video.status == "ready"
+        ):
+            logger.info(
+                "[pipeline] ignoring errback for completed job=%s",
+                job_id,
+            )
+            return
+        job.status = models.JobStatus.failed.value
+        job.error_message = error_message
+        video.status = "failed"
+        db.commit()
+        # Header tasks can still be unwinding when the first chord failure
+        # arrives. The cleanup worker takes the job lock exclusively and
+        # retries instead of racing those live mutators.
+        side_effects = (
+            (
+                "workspace cleanup request",
+                lambda: request_workspace_cleanup(
+                    job_id,
+                    trigger=cleanup_trigger,
+                ),
+            ),
+            (
+                "progress repair",
+                lambda: progress_tracker.set_percent(
+                    video_id,
+                    0,
+                    "Failed after retries",
+                    job_id=job_id,
+                ),
+            ),
+            (
+                "status event",
+                lambda: publish_event(
+                    "video.status_changed",
+                    {"video_id": video_id, "status": "failed"},
+                ),
+            ),
+        )
+        for description, action in side_effects:
+            try:
+                action()
+            except Exception:
+                # These systems may be the reason orchestration exhausted its
+                # retries. Attempt every repair independently after the
+                # generation-fenced database failure is durable.
+                logger.exception(
+                    "[pipeline] job=%s failed to perform %s",
+                    job_id,
+                    description,
+                )
+    finally:
+        db.close()
+
+
+class PipelineDispatchTask(Task):
+    """Finalize a generation when orchestration itself exhausts retries."""
+
+    def on_failure(self, exc, task_id, args, kwargs, einfo):
+        del task_id, einfo
+        try:
+            job_id = kwargs.get("job_id") if kwargs else None
+            video_id = kwargs.get("video_id") if kwargs else None
+            if job_id is None and len(args or ()) > 0:
+                job_id = args[0]
+            if video_id is None and len(args or ()) > 2:
+                video_id = args[2]
+            if job_id is None or video_id is None:
+                logger.error(
+                    "[pipeline] cannot finalize orchestration failure: "
+                    "job/video arguments are missing"
+                )
+                return
+            logger.error(
+                "[pipeline] video=%s job=%s orchestration exhausted retries: %s",
+                video_id,
+                job_id,
+                exc,
+            )
+            _finalize_pipeline_failure(
+                str(video_id),
+                str(job_id),
+                error_message=(
+                    "Pipeline orchestration exhausted retries "
+                    f"({type(exc).__name__})"
+                ),
+                cleanup_trigger="pipeline-dispatch-failure",
+            )
+        except Exception:
+            # Celery is already recording the terminal task failure. Never let
+            # a secondary reporting/cleanup error hide that original cause.
+            logger.exception(
+                "[pipeline] failed to finalize orchestration failure"
+            )
+
+
 @celery_app.task(
     bind=True,
+    base=PipelineDispatchTask,
     autoretry_for=(Exception,),
     retry_backoff=True,
     max_retries=2,
@@ -602,47 +940,15 @@ def run_pipeline(
 def on_pipeline_failure(
     self, video_id: str, job_id: str, *args, **kwargs,
 ) -> None:
-    logger.error("[pipeline] video=%s job=%s failed after task retries", video_id, job_id)
-    db = SessionLocal()
-    try:
-        try:
-            job, video = lock_current_job(db, job_id, allow_completed=True)
-        except (StaleJobError, ValueError) as exc:
-            logger.info(
-                "[pipeline] ignoring delayed errback job=%s: %s",
-                job_id,
-                exc,
-            )
-            return
-        if (
-            job.status == models.JobStatus.completed.value
-            or video.status == "ready"
-        ):
-            logger.info(
-                "[pipeline] ignoring errback for completed job=%s",
-                job_id,
-            )
-            return
-        job.status = models.JobStatus.failed.value
-        job.error_message = "Pipeline task exhausted retries"
-        video.status = "failed"
-        db.commit()
-        # Header tasks can still be unwinding when the first chord failure
-        # arrives. The cleanup worker takes the job lock exclusively and
-        # retries instead of racing those live mutators.
-        request_workspace_cleanup(
-            job_id,
-            trigger="pipeline-failure",
-        )
-        progress_tracker.set_percent(
-            video_id,
-            0,
-            "Failed after retries",
-            job_id=job_id,
-        )
-        publish_event(
-            "video.status_changed",
-            {"video_id": video_id, "status": "failed"},
-        )
-    finally:
-        db.close()
+    del self, args, kwargs
+    logger.error(
+        "[pipeline] video=%s job=%s failed after task retries",
+        video_id,
+        job_id,
+    )
+    _finalize_pipeline_failure(
+        video_id,
+        job_id,
+        error_message="Pipeline task exhausted retries",
+        cleanup_trigger="pipeline-failure",
+    )

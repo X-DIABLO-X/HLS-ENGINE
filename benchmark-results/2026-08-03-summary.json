@@ -1,0 +1,148 @@
+{
+  "schema_version": 1,
+  "run_date": "2026-08-03",
+  "hardware": {
+    "os": "Windows 11 with Docker Desktop",
+    "cpu": "Intel Core i5-13500HX",
+    "logical_processors": 20,
+    "memory_gib": 31.7,
+    "gpu": "NVIDIA GeForce RTX 4050 Laptop GPU",
+    "gpu_memory_gib": 6
+  },
+  "source": {
+    "container_duration_seconds": 7177.832,
+    "video_codec": "h264",
+    "width": 1920,
+    "height": 804,
+    "frames_per_second": 24,
+    "size_bytes": 2584532929,
+    "audio_tracks": 2,
+    "subtitle_tracks": 3
+  },
+  "full_encoded_e2e": {
+    "status": "passed",
+    "ffmpeg_version": "8.1.2",
+    "profile": "grouped_nvenc_turbo",
+    "renditions": [
+      720,
+      480
+    ],
+    "upload_transfer_seconds": 44.391,
+    "source_setup_and_probe_seconds_approx": 30.2,
+    "audio_task_seconds": [
+      262.792,
+      372.419
+    ],
+    "video_encode_seconds": 740.063,
+    "publish_seconds": 21.453,
+    "ready_seconds": 842.641,
+    "delete_verified_seconds": 845.891,
+    "task_retries": 0,
+    "worker_restarts": 0,
+    "container_restarts": 0,
+    "gpu_recovery_attempts": 0,
+    "cpu_video_fallbacks": 0,
+    "progress_regressions": 0,
+    "playlists_verified": 7,
+    "workspace_cleanup_seconds": 2.25,
+    "media_delete_seconds": 0.703,
+    "source_preserved": true
+  },
+  "sample_matrix": {
+    "method": {
+      "clip_count": 2,
+      "clip_seconds": 120,
+      "total_sampled_source_seconds": 240,
+      "clip_start_seconds": [
+        2352,
+        4704
+      ],
+      "segment_seconds": 6,
+      "max_nvenc_sessions": 2,
+      "vmaf_reference": "resolution-matched source",
+      "ffmpeg_version": "8.1.1"
+    },
+    "excluded_raw_report_sha256": {
+      "primary": "ABFC737239F86619E595AF130BC383D56DDC1965EC4ADD8BE1AC9DE4E01EBCFE",
+      "hybrid": "075421929D2650A5BA3290BC24348540EEE91764BD9725357A4C408987645AB6"
+    },
+    "candidates": [
+      {
+        "id": "grouped_nvenc_quality",
+        "encode_wall_seconds": 18.385796,
+        "source_realtime_factor": 13.053555,
+        "projected_full_source_seconds": 549.876,
+        "vmaf_720p": 93.736349,
+        "vmaf_480p": 94.158671
+      },
+      {
+        "id": "grouped_nvenc_balanced",
+        "encode_wall_seconds": 12.180164,
+        "source_realtime_factor": 19.704169,
+        "projected_full_source_seconds": 364.28,
+        "vmaf_720p": 93.584314,
+        "vmaf_480p": 94.107598
+      },
+      {
+        "id": "grouped_nvenc_turbo",
+        "encode_wall_seconds": 9.894006,
+        "source_realtime_factor": 24.257111,
+        "projected_full_source_seconds": 295.906,
+        "vmaf_720p": 93.566554,
+        "vmaf_480p": 94.09721
+      },
+      {
+        "id": "separate_nvenc_renditions_parallel",
+        "encode_wall_seconds": 18.709321,
+        "source_realtime_factor": 12.82783,
+        "projected_full_source_seconds": 559.552,
+        "vmaf_720p": 93.736349,
+        "vmaf_480p": 94.158671
+      },
+      {
+        "id": "temporal_nvenc_chunks_parallel",
+        "encode_wall_seconds": 22.739585,
+        "source_realtime_factor": 10.554282,
+        "projected_full_source_seconds": 680.087,
+        "vmaf_720p": 93.774338,
+        "vmaf_480p": 94.187755
+      },
+      {
+        "id": "single_nvenc_720p",
+        "encode_wall_seconds": 12.605748,
+        "source_realtime_factor": 19.038934,
+        "projected_full_source_seconds": 377.008,
+        "vmaf_720p": 93.736349
+      },
+      {
+        "id": "single_nvenc_480p",
+        "encode_wall_seconds": 7.721534,
+        "source_realtime_factor": 31.081905,
+        "projected_full_source_seconds": 230.933,
+        "vmaf_480p": 94.158671
+      },
+      {
+        "id": "h264_stream_copy_direct_play",
+        "encode_wall_seconds": 0.495357,
+        "source_realtime_factor": 484.49945,
+        "projected_full_source_seconds": 14.815,
+        "quality": "lossless-by-copy"
+      },
+      {
+        "id": "intel_qsv_480p",
+        "encode_wall_seconds": 17.500773,
+        "source_realtime_factor": 13.71368,
+        "projected_full_source_seconds": 523.407,
+        "vmaf_480p": 62.832538
+      },
+      {
+        "id": "hybrid_nvenc_720p_qsv_480p_parallel",
+        "encode_wall_seconds": 16.978749,
+        "source_realtime_factor": 14.135317,
+        "projected_full_source_seconds": 507.794,
+        "vmaf_720p": 93.584314,
+        "vmaf_480p": 62.832538
+      }
+    ]
+  }
+}

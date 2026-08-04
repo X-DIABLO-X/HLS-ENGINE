@@ -9,7 +9,7 @@ from contextlib import asynccontextmanager
 from typing import List, Optional
 from urllib.parse import quote, unquote, urlsplit
 
-from fastapi import FastAPI, HTTPException, Response
+from fastapi import FastAPI, Header, HTTPException, Response
 from prometheus_client import (
     CONTENT_TYPE_LATEST,
     Counter,
@@ -301,6 +301,7 @@ async def ready():
 @app.post("/jobs", response_model=SubmitJobResponse)
 async def submit_job(req: SubmitJobRequest):
     from app import models
+    from app import progress as progress_tracker
     from app.tasks.pipeline import run_pipeline
 
     video_id = req.video_id or str(uuid.uuid4())
@@ -324,6 +325,7 @@ async def submit_job(req: SubmitJobRequest):
     finally:
         db.close()
 
+    pipeline_settings = progress_tracker.get_default_settings()
     run_pipeline.delay(
         job_id=job_id,
         source_url=req.source_url,
@@ -332,6 +334,7 @@ async def submit_job(req: SubmitJobRequest):
         renditions=req.renditions,
         audio_languages=req.audio_languages,
         subtitle_languages=req.subtitle_languages,
+        settings=pipeline_settings,
     )
     transcode_jobs_total.labels(status="submitted").inc()
     return {"job_id": job_id, "video_id": video_id, "status": "submitted"}
@@ -402,6 +405,8 @@ async def get_video(video_id: str):
             "frame_rate": video.frame_rate,
             "renditions": [
                 {
+                    "name": r.name,
+                    "is_original": bool(getattr(r, "is_original", False)),
                     "height": r.height,
                     "width": r.width,
                     "bandwidth": r.bandwidth,
@@ -482,7 +487,10 @@ def _seed_progress_generation(video_id: str, job_id: str) -> None:
 
 
 @app.post("/videos/{video_id}/retry", response_model=RetryJobResponse)
-async def retry_video(video_id: str):
+async def retry_video(
+    video_id: str,
+    x_authenticated_user_id: Optional[str] = Header(default=None),
+):
     """Re-dispatch the transcoding pipeline for a stuck or failed video.
 
     Creates a fresh job and dispatches run_pipeline. Cleans up any stale
@@ -507,6 +515,13 @@ async def retry_video(video_id: str):
         try:
             video = lock_video(db, video_id)
         except ValueError:
+            raise HTTPException(status_code=404, detail="Video not found")
+        # Gateway-injected identity prevents one creator from retrying another
+        # creator's source or replacing its published media.
+        if (
+            not x_authenticated_user_id
+            or str(video.owner_user_id) != x_authenticated_user_id
+        ):
             raise HTTPException(status_code=404, detail="Video not found")
 
         # Already ready? No point retrying.

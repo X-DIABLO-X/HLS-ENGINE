@@ -82,7 +82,12 @@ def _run_extract_audio(self, job_id: str, source_url: str, audio_info: dict, set
     settings = settings or {}
     audio_info = dict(audio_info or {})
     audio_bitrate = f"{settings.get('audio_bitrate_kbps', 128)}k"
-    audio_channels = settings.get("audio_channels", 2)
+    try:
+        audio_channels = int(settings.get("audio_channels", 2))
+    except (TypeError, ValueError) as exc:
+        raise ValueError("audio_channels must be a positive integer") from exc
+    if audio_channels <= 0:
+        raise ValueError("audio_channels must be a positive integer")
     seg_dur = settings.get("segment_duration_sec", ffmpeg_utils.SEGMENT_DURATION)
     lang = models.normalize_track_language(audio_info.get("language"))
     try:
@@ -121,7 +126,8 @@ def _run_extract_audio(self, job_id: str, source_url: str, audio_info: dict, set
             job_id=job_id,
         )
 
-        work_dir = os.path.join(get_settings().WORK_DIR, job_id)
+        app_settings = get_settings()
+        work_dir = os.path.join(app_settings.WORK_DIR, job_id)
         local_source = os.path.join(work_dir, "source.mp4")
         raw_dir = os.path.join(work_dir, "audio", track_id)
         raw_path = os.path.join(raw_dir, "audio.m4a")
@@ -193,7 +199,11 @@ def _run_extract_audio(self, job_id: str, source_url: str, audio_info: dict, set
 
         local_source = ensure_local_source(job_id, source_url)
 
-        channels = audio_info.get("channels", audio_channels)
+        # The configured value describes the published rendition.  Source
+        # channel metadata is only an input-compatibility check; using it as
+        # the output value silently bypassed requested downmixes (for example
+        # a 5.1 source published when stereo was configured).
+        channels = audio_channels
         source_codec = audio_info.get("codec_name", "aac")
         # Preserve any intentional audio delay encoded in the source metadata
         # (e.g. MP4 edit list / Matroska offset). parse_probe populated this
@@ -216,7 +226,34 @@ def _run_extract_audio(self, job_id: str, source_url: str, audio_info: dict, set
         # A failed FFmpeg attempt can leave a valid-looking playlist that
         # references incomplete segments. Every retry starts atomically clean.
         _reset_audio_output(playlist_dir)
-        loudnorm = settings.get("loudnorm", True) and source_codec.lower() not in ("aac", "mp3")
+        # Normalization is an explicit pipeline setting.  The source codec
+        # must not silently disable it; when enabled it also correctly fences
+        # AAC stream-copy eligibility.
+        loudnorm = bool(settings.get("loudnorm", True))
+        aac_passthrough_enabled = bool(
+            settings.get("aac_passthrough_enabled", False)
+        )
+        source_channels = audio_info.get("channels")
+        source_sample_rate = audio_info.get("sample_rate")
+        source_profile = audio_info.get("profile")
+        passthrough_selected = (
+            aac_passthrough_enabled
+            and ffmpeg_utils._can_passthrough_aac(
+                source_codec=source_codec,
+                source_profile=source_profile,
+                source_channels=source_channels,
+                source_sample_rate=source_sample_rate,
+                output_channels=channels,
+                loudnorm=loudnorm,
+                audio_delay_ms=audio_delay_ms,
+            )
+        )
+        if passthrough_selected:
+            logger.info(
+                "[extract_audio] job=%s lang=%s using AAC passthrough",
+                job_id,
+                lang,
+            )
 
         def on_progress(pct):
             progress_tracker.update_task(
@@ -228,6 +265,7 @@ def _run_extract_audio(self, job_id: str, source_url: str, audio_info: dict, set
             )
 
         combined_ok = False
+        passthrough_used = False
         if True:
             try:
                 cmd = ffmpeg_utils.combined_audio_command(
@@ -236,10 +274,16 @@ def _run_extract_audio(self, job_id: str, source_url: str, audio_info: dict, set
                     bitrate_kbps=bitrate_kbps, channels=channels,
                     segment_duration=seg_dur, loudnorm=loudnorm,
                     source_codec=source_codec,
+                    source_profile=source_profile,
                     audio_delay_ms=audio_delay_ms,
+                    aac_passthrough_enabled=aac_passthrough_enabled,
+                    source_channels=source_channels,
+                    source_sample_rate=source_sample_rate,
                 )
                 ffmpeg_utils.run_cmd_with_progress(cmd, duration, on_progress)
+                _validate_audio_output(playlist_dir, playlist_path)
                 combined_ok = True
+                passthrough_used = passthrough_selected
             except Exception as exc:
                 logger.warning(
                     "[extract_audio] combined command failed for job=%s lang=%s, "
@@ -253,15 +297,22 @@ def _run_extract_audio(self, job_id: str, source_url: str, audio_info: dict, set
             cmd = ffmpeg_utils.extract_audio_command(
                 local_source, raw_path,
                 stream_index=stream_index, language=lang,
-                bitrate=audio_bitrate, channels=audio_channels,
+                bitrate=audio_bitrate, channels=channels,
                 audio_delay_ms=audio_delay_ms,
+                loudnorm=loudnorm,
             )
             ffmpeg_utils.run_cmd_with_progress(cmd, duration, on_progress)
             cmd2 = ffmpeg_utils.package_audio_command(raw_path, playlist_dir, seg_dur)
             ffmpeg_utils.run_cmd(cmd2)
-
-        _validate_audio_output(playlist_dir, playlist_path)
+            _validate_audio_output(playlist_dir, playlist_path)
         bitrate_val = bitrate_kbps * 1000
+        if passthrough_used:
+            try:
+                source_bitrate = int(audio_info.get("bit_rate") or 0)
+            except (TypeError, ValueError):
+                source_bitrate = 0
+            if source_bitrate > 0:
+                bitrate_val = source_bitrate
 
         # Retry creation may supersede this job while FFmpeg is running. Lock
         # the generation again before any video-wide row is recreated.

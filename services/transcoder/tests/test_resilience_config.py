@@ -143,6 +143,23 @@ class ResilienceConfigTests(unittest.TestCase):
         )
         self.assertGreaterEqual(compose.count("init: true"), 2)
 
+    def test_compose_exposes_snapshotted_media_switches(self):
+        compose = (REPO_ROOT / "docker-compose.yml").read_text(
+            encoding="utf-8"
+        )
+
+        self.assertEqual(
+            compose.count("NVENC_PROFILE: ${NVENC_PROFILE:-}"),
+            4,
+        )
+        self.assertEqual(
+            compose.count(
+                "AAC_PASSTHROUGH_ENABLED: "
+                "${AAC_PASSTHROUGH_ENABLED:-false}"
+            ),
+            3,
+        )
+
     def test_worker_execs_celery_and_does_not_detach_heartbeat(self):
         wrapper = (
             REPO_ROOT / "services" / "transcoder" / "celery-worker-start.sh"

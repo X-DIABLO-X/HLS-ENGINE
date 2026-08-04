@@ -44,6 +44,111 @@ class _SequenceSession:
 
 
 class GenerationAuthorityTests(unittest.TestCase):
+    def test_exhausted_orchestration_retries_fail_current_generation(self):
+        job = SimpleNamespace(
+            id="job-dispatch",
+            video_id="video-dispatch",
+            status=models.JobStatus.probing.value,
+            error_message=None,
+        )
+        video = SimpleNamespace(id=job.video_id, status="processing")
+        db = Mock()
+
+        with (
+            patch.object(pipeline, "SessionLocal", return_value=db),
+            patch.object(
+                pipeline,
+                "lock_current_job",
+                return_value=(job, video),
+            ),
+            patch.object(
+                pipeline,
+                "request_workspace_cleanup",
+            ) as cleanup,
+            patch.object(
+                pipeline.progress_tracker,
+                "set_percent",
+            ) as set_percent,
+            patch.object(pipeline, "publish_event") as publish_event,
+        ):
+            pipeline.run_pipeline.on_failure(
+                OSError("broker unavailable"),
+                "celery-task-id",
+                (job.id, "minio://uploads/source.mkv", video.id),
+                {},
+                None,
+            )
+
+        self.assertEqual(job.status, models.JobStatus.failed.value)
+        self.assertEqual(video.status, "failed")
+        self.assertIn("orchestration exhausted retries", job.error_message)
+        db.commit.assert_called_once_with()
+        cleanup.assert_called_once_with(
+            job.id,
+            trigger="pipeline-dispatch-failure",
+        )
+        set_percent.assert_called_once_with(
+            video.id,
+            0,
+            "Failed after retries",
+            job_id=job.id,
+        )
+        publish_event.assert_called_once_with(
+            "video.status_changed",
+            {"video_id": video.id, "status": "failed"},
+        )
+
+    def test_failure_finalization_still_publishes_when_progress_repair_fails(self):
+        job = SimpleNamespace(
+            id="job-progress-down",
+            video_id="video-progress-down",
+            status=models.JobStatus.probing.value,
+            error_message=None,
+        )
+        video = SimpleNamespace(id=job.video_id, status="processing")
+        db = Mock()
+
+        with (
+            patch.object(pipeline, "SessionLocal", return_value=db),
+            patch.object(
+                pipeline,
+                "lock_current_job",
+                return_value=(job, video),
+            ),
+            patch.object(
+                pipeline,
+                "request_workspace_cleanup",
+            ) as cleanup,
+            patch.object(
+                pipeline.progress_tracker,
+                "set_percent",
+                side_effect=ConnectionError("redis unavailable"),
+            ) as set_percent,
+            patch.object(pipeline, "publish_event") as publish_event,
+        ):
+            pipeline._finalize_pipeline_failure(
+                video.id,
+                job.id,
+                error_message="Pipeline failed after retries",
+                cleanup_trigger="test-failure",
+            )
+
+        self.assertEqual(job.status, models.JobStatus.failed.value)
+        self.assertEqual(video.status, "failed")
+        db.commit.assert_called_once_with()
+        cleanup.assert_called_once_with(job.id, trigger="test-failure")
+        set_percent.assert_called_once_with(
+            video.id,
+            0,
+            "Failed after retries",
+            job_id=job.id,
+        )
+        publish_event.assert_called_once_with(
+            "video.status_changed",
+            {"video_id": video.id, "status": "failed"},
+        )
+        db.close.assert_called_once_with()
+
     def test_old_job_is_rejected_when_new_generation_exists(self):
         video = SimpleNamespace(id="video-1", status="processing")
         old = SimpleNamespace(
@@ -226,6 +331,10 @@ class PipelineDispatchTests(unittest.TestCase):
             patch.object(pipeline, "chord", chord_factory),
             patch.object(pipeline.progress_tracker, "init_progress"),
             patch.object(pipeline.progress_tracker, "complete_task"),
+            patch.object(
+                pipeline.progress_tracker,
+                "configure_chunked_task",
+            ),
         ):
             with self.assertRaisesRegex(OSError, "post-send"):
                 pipeline._run_pipeline(

@@ -2,6 +2,7 @@ import os
 import tempfile
 import unittest
 from types import SimpleNamespace
+from unittest.mock import patch
 
 from app import models
 from app.tasks.package import _rel_path, _write_master
@@ -25,7 +26,7 @@ class TrackIdentityTests(unittest.TestCase):
         )
         self.assertEqual(
             [track["name"] for track in prepared],
-            ["IND", "IND 2", "ENG"],
+            ["Indonesian", "Indonesian 2", "English"],
         )
         self.assertEqual(
             [track["language"] for track in prepared],
@@ -33,7 +34,7 @@ class TrackIdentityTests(unittest.TestCase):
         )
         self.assertNotIn("track_id", tracks[0])
 
-    def test_metadata_titles_are_preferred_and_made_group_unique(self):
+    def test_metadata_titles_are_not_exposed_as_track_labels(self):
         tracks = [
             {
                 "language": "ind",
@@ -49,8 +50,8 @@ class TrackIdentityTests(unittest.TestCase):
 
         prepared = models.assign_track_identities(tracks, "audio_index")
 
-        self.assertEqual(prepared[0]["name"], "Main 'mix'")
-        self.assertEqual(prepared[1]["name"], "Main 'mix' 2")
+        self.assertEqual(prepared[0]["name"], "Indonesian")
+        self.assertEqual(prepared[1]["name"], "Indonesian 2")
 
     def test_direct_task_fallback_is_path_safe_and_stream_specific(self):
         self.assertEqual(
@@ -75,7 +76,7 @@ class TrackIdentityTests(unittest.TestCase):
 
         self.assertEqual(prepared[0]["language"], "und")
         self.assertEqual(prepared[0]["track_id"], "und")
-        self.assertEqual(prepared[0]["name"], "UND")
+        self.assertEqual(prepared[0]["name"], "Unknown language")
 
     def test_track_identity_can_be_recovered_for_package_fallback(self):
         track = SimpleNamespace(
@@ -162,9 +163,21 @@ class MasterPlaylistTrackTests(unittest.TestCase):
             ]
             master_path = os.path.join(output_dir, "master.m3u8")
 
-            _write_master(
-                master_path, output_dir, renditions, audio, subtitles
-            )
+            with patch(
+                "app.tasks.package.ffmpeg_utils.ffprobe",
+                return_value={
+                    "streams": [
+                        {
+                            "codec_type": "video",
+                            "width": 1280,
+                            "height": 720,
+                        }
+                    ]
+                },
+            ):
+                _write_master(
+                    master_path, output_dir, renditions, audio, subtitles
+                )
 
             with open(master_path, encoding="utf-8") as handle:
                 master = handle.read()
@@ -178,8 +191,13 @@ class MasterPlaylistTrackTests(unittest.TestCase):
         self.assertIn(
             'URI="subtitles_ind_2/subtitles.m3u8"', master
         )
+        self.assertIn(
+            'TYPE=SUBTITLES,GROUP-ID="subs",NAME="English",DEFAULT=YES,'
+            'AUTOSELECT=YES,LANGUAGE="eng"',
+            master,
+        )
         self.assertIn('CODECS="avc1.640028,mp4a.40.2"', master)
-        self.assertEqual(master.count("DEFAULT=YES"), 1)
+        self.assertEqual(master.count("DEFAULT=YES"), 2)
 
     def test_master_uniquifies_duplicate_persisted_names(self):
         with tempfile.TemporaryDirectory() as output_dir:

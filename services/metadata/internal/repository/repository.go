@@ -29,29 +29,34 @@ type VideoDeletion interface {
 
 // Video represents a video asset.
 type Video struct {
-	ID          string     `json:"id"`
-	Title       string     `json:"title"`
-	Description string     `json:"description,omitempty"`
-	Status      string     `json:"status"`
-	Duration    *float64   `json:"duration,omitempty"`
-	Tags        []string   `json:"tags,omitempty"`
-	Metadata    []byte     `json:"metadata,omitempty"`
-	CreatedAt   time.Time  `json:"createdAt"`
-	UpdatedAt   time.Time  `json:"updatedAt"`
-	PublishedAt *time.Time `json:"publishedAt,omitempty"`
+	ID           string     `json:"id"`
+	OwnerUserID  string     `json:"ownerUserId,omitempty"`
+	ShareID      *string    `json:"shareId,omitempty"`
+	ShareEnabled bool       `json:"shareEnabled,omitempty"`
+	ThumbnailURL string     `json:"thumbnailUrl,omitempty"`
+	Title        string     `json:"title"`
+	Description  string     `json:"description,omitempty"`
+	Status       string     `json:"status"`
+	Duration     *float64   `json:"duration,omitempty"`
+	Tags         []string   `json:"tags,omitempty"`
+	Metadata     []byte     `json:"metadata,omitempty"`
+	CreatedAt    time.Time  `json:"createdAt"`
+	UpdatedAt    time.Time  `json:"updatedAt"`
+	PublishedAt  *time.Time `json:"publishedAt,omitempty"`
 }
 
 // Rendition represents an HLS rendition.
 type Rendition struct {
-	ID        string    `json:"id"`
-	VideoID   string    `json:"video_id"`
-	Name      string    `json:"name"`
-	Bandwidth int       `json:"bandwidth"`
-	Width     int       `json:"width"`
-	Height    int       `json:"height"`
-	Codec     string    `json:"codec"`
-	MasterURL string    `json:"master_url,omitempty"`
-	CreatedAt time.Time `json:"created_at"`
+	ID         string    `json:"id"`
+	VideoID    string    `json:"video_id"`
+	Name       string    `json:"name"`
+	IsOriginal bool      `json:"is_original"`
+	Bandwidth  int       `json:"bandwidth"`
+	Width      int       `json:"width"`
+	Height     int       `json:"height"`
+	Codec      string    `json:"codec"`
+	MasterURL  string    `json:"master_url,omitempty"`
+	CreatedAt  time.Time `json:"created_at"`
 }
 
 // AudioTrack represents an audio track.
@@ -85,9 +90,10 @@ func New(pool *pgxpool.Pool) *Repository {
 	return &Repository{pool: pool}
 }
 
-func (r *Repository) CreateVideo(ctx context.Context, title, description string, tags []string) (*Video, error) {
+func (r *Repository) CreateVideo(ctx context.Context, ownerUserID, title, description string, tags []string) (*Video, error) {
 	v := &Video{
 		ID:          uuid.NewString(),
+		OwnerUserID: ownerUserID,
 		Title:       title,
 		Description: description,
 		Status:      "uploading",
@@ -96,9 +102,9 @@ func (r *Repository) CreateVideo(ctx context.Context, title, description string,
 		UpdatedAt:   time.Now().UTC(),
 	}
 	_, err := r.pool.Exec(ctx, `
-		INSERT INTO videos (id, title, description, status, tags, created_at, updated_at)
-		VALUES ($1, $2, $3, $4, $5, $6, $6)
-	`, v.ID, v.Title, v.Description, v.Status, v.Tags, v.CreatedAt)
+		INSERT INTO videos (id, owner_user_id, title, description, status, tags, created_at, updated_at)
+		VALUES ($1, $2, $3, $4, $5, $6, $7, $7)
+	`, v.ID, v.OwnerUserID, v.Title, v.Description, v.Status, v.Tags, v.CreatedAt)
 	if err != nil {
 		return nil, fmt.Errorf("insert video: %w", err)
 	}
@@ -390,21 +396,22 @@ func (r *Repository) UpdateStatus(ctx context.Context, id, status string) error 
 	return err
 }
 
-func (r *Repository) CreateRendition(ctx context.Context, videoID, name, codec string, bandwidth, width, height int) (*Rendition, error) {
+func (r *Repository) CreateRendition(ctx context.Context, videoID, name, codec string, isOriginal bool, bandwidth, width, height int) (*Rendition, error) {
 	rend := &Rendition{
-		ID:        uuid.NewString(),
-		VideoID:   videoID,
-		Name:      name,
-		Codec:     codec,
-		Bandwidth: bandwidth,
-		Width:     width,
-		Height:    height,
-		CreatedAt: time.Now().UTC(),
+		ID:         uuid.NewString(),
+		VideoID:    videoID,
+		Name:       name,
+		IsOriginal: isOriginal,
+		Codec:      codec,
+		Bandwidth:  bandwidth,
+		Width:      width,
+		Height:     height,
+		CreatedAt:  time.Now().UTC(),
 	}
 	_, err := r.pool.Exec(ctx, `
-		INSERT INTO renditions (id, video_id, name, codec, bandwidth, width, height, created_at)
-		VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
-	`, rend.ID, rend.VideoID, rend.Name, rend.Codec, rend.Bandwidth, rend.Width, rend.Height, rend.CreatedAt)
+		INSERT INTO renditions (id, video_id, name, is_original, codec, bandwidth, width, height, created_at)
+		VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
+	`, rend.ID, rend.VideoID, rend.Name, rend.IsOriginal, rend.Codec, rend.Bandwidth, rend.Width, rend.Height, rend.CreatedAt)
 	if err != nil {
 		return nil, err
 	}
@@ -413,7 +420,7 @@ func (r *Repository) CreateRendition(ctx context.Context, videoID, name, codec s
 
 func (r *Repository) ListRenditions(ctx context.Context, videoID string) ([]*Rendition, error) {
 	rows, err := r.pool.Query(ctx, `
-		SELECT id, video_id, name, codec, bandwidth, width, height, master_url, created_at
+		SELECT id, video_id, name, is_original, codec, bandwidth, width, height, master_url, created_at
 		FROM renditions WHERE video_id = $1 ORDER BY bandwidth DESC
 	`, videoID)
 	if err != nil {
@@ -423,7 +430,7 @@ func (r *Repository) ListRenditions(ctx context.Context, videoID string) ([]*Ren
 	var list = []*Rendition{}
 	for rows.Next() {
 		rend := &Rendition{}
-		if err := rows.Scan(&rend.ID, &rend.VideoID, &rend.Name, &rend.Codec, &rend.Bandwidth, &rend.Width, &rend.Height, &rend.MasterURL, &rend.CreatedAt); err != nil {
+		if err := rows.Scan(&rend.ID, &rend.VideoID, &rend.Name, &rend.IsOriginal, &rend.Codec, &rend.Bandwidth, &rend.Width, &rend.Height, &rend.MasterURL, &rend.CreatedAt); err != nil {
 			return nil, err
 		}
 		list = append(list, rend)

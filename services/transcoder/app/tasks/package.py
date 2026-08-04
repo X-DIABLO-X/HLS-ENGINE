@@ -180,6 +180,43 @@ def _media_names(tracks: list) -> list:
     return names
 
 
+def _actual_rendition_resolution(rendition) -> tuple:
+    """Probe the packaged media so the master never advertises scale boxes."""
+    playlist_path = getattr(rendition, "playlist_path", None)
+    if not playlist_path:
+        raise RuntimeError("rendition has no playlist to probe")
+    try:
+        probe = ffmpeg_utils.ffprobe(playlist_path)
+    except Exception as exc:
+        raise RuntimeError(
+            f"could not probe rendition playlist dimensions: {playlist_path}"
+        ) from exc
+    stream = next(
+        (
+            candidate
+            for candidate in probe.get("streams", [])
+            if candidate.get("codec_type") == "video"
+        ),
+        None,
+    )
+    if stream is None:
+        raise RuntimeError(
+            f"rendition playlist has no video stream: {playlist_path}"
+        )
+    try:
+        width = int(stream.get("width"))
+        height = int(stream.get("height"))
+    except (TypeError, ValueError) as exc:
+        raise RuntimeError(
+            f"rendition playlist has invalid video dimensions: {playlist_path}"
+        ) from exc
+    if width <= 0 or height <= 0:
+        raise RuntimeError(
+            f"rendition playlist has invalid video dimensions: {playlist_path}"
+        )
+    return width, height
+
+
 def _write_master(
     master_path: str,
     output_dir: str,
@@ -217,6 +254,18 @@ def _write_master(
 
     if subtitles:
         subtitle_names = _media_names(subtitles)
+        # Prefer an English subtitle for automatic playback.  It is the most
+        # broadly useful default for mixed-language releases; if absent, make
+        # the first source subtitle available rather than leaving all tracks
+        # disabled by default.
+        default_idx = next(
+            (
+                idx
+                for idx, track in enumerate(subtitles)
+                if models.normalize_track_language(track.language) == "eng"
+            ),
+            0,
+        )
         for idx, track in enumerate(subtitles):
             lang = models.normalize_track_language(track.language)
             name = subtitle_names[idx]
@@ -225,16 +274,30 @@ def _write_master(
             )
             lines.append(
                 f'#EXT-X-MEDIA:TYPE=SUBTITLES,GROUP-ID="subs",NAME="{name}",'
-                f'DEFAULT=NO,AUTOSELECT=YES,LANGUAGE="{lang}",URI="{uri}"'
+                f'DEFAULT={"YES" if idx == default_idx else "NO"},AUTOSELECT=YES,'
+                f'LANGUAGE="{lang}",URI="{uri}"'
             )
 
     for rendition in renditions:
         bw = rendition.bandwidth or 1
-        res = f"{rendition.width}x{rendition.height}"
+        actual_width, actual_height = _actual_rendition_resolution(rendition)
+        res = f"{actual_width}x{actual_height}"
         rcodec = rendition.codec or "h264"
+        profile = getattr(rendition, "profile", None) or "high"
         try:
-            codecs = ffmpeg_utils.codecs_string(rcodec, rendition.height or 1080)
+            codecs = ffmpeg_utils.codecs_string(
+                rcodec,
+                rendition.height or 1080,
+                profile,
+            )
         except Exception:
+            # Direct-play metadata is derived from the source bitstream and
+            # forms a playback-compatibility boundary.  Never turn malformed
+            # persisted direct metadata into a plausible-but-false default.
+            if str(profile).strip().lower().startswith("direct-h264:"):
+                raise
+            # Preserve the historical fallback for legacy encoded rows whose
+            # profile metadata predates strict validation.
             codecs = "avc1.640029"
         if audio_tracks:
             # RFC 8216 requires CODECS to enumerate every media format present

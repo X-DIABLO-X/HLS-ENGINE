@@ -381,7 +381,10 @@ class SinglePassIdempotencyTests(unittest.TestCase):
                     "minio://unused/source.mkv",
                     specs,
                     None,
-                    {"segment_format": "fmp4"},
+                    {
+                        "segment_format": "fmp4",
+                        "nvenc_profile": "turbo",
+                    },
                 )
                 commits_after_first = db.commit_count
                 second = transcode_tasks.transcode_group.run(
@@ -389,12 +392,19 @@ class SinglePassIdempotencyTests(unittest.TestCase):
                     "minio://unused/source.mkv",
                     specs,
                     None,
-                    {"segment_format": "fmp4"},
+                    {
+                        "segment_format": "fmp4",
+                        "nvenc_profile": "turbo",
+                    },
                 )
 
         self.assertFalse(first["reused"])
         self.assertTrue(second["reused"])
         self.assertEqual(command.call_count, 1)
+        self.assertEqual(
+            command.call_args.kwargs["nvenc_profile"],
+            "turbo",
+        )
         acquire.assert_called_once_with(
             "test-worker",
             slots=len(specs),
@@ -499,6 +509,22 @@ class SinglePassIdempotencyTests(unittest.TestCase):
                     str(rendition_dir),
                     ".m4s",
                     expected_duration=600.0,
+                )
+
+    def test_endlist_does_not_make_an_overlong_attempt_complete(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            rendition_dir = _write_fmp4_rendition(
+                Path(temp_dir) / "output",
+                720,
+            )
+            with self.assertRaisesRegex(
+                RenditionValidationError,
+                "duration exceeds the source",
+            ):
+                _validate_rendition_directory(
+                    str(rendition_dir),
+                    ".m4s",
+                    expected_duration=2.0,
                 )
 
     def test_duplicate_rows_are_removed_without_an_internal_commit(self):
