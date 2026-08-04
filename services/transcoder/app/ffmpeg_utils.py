@@ -2810,10 +2810,17 @@ def thumbnail_commands(
         # Cap gallery thumbs ~120 (interval grows for long sources); guarantee >=1.
         thumb_interval = max(1, min(max(10, int(math.ceil(duration / 120))),
                                      max(1, int(math.ceil(duration)))))
+    # A fixed one-second poster routinely catches distributor slates, fades,
+    # and black openings. Sample into the programme instead: 12% is far enough
+    # past an intro on feature-length sources while the 12-second floor keeps
+    # short clips recognisable. Never seek beyond the final two seconds.
+    poster_seek = 1.0
+    if duration > 0:
+        poster_seek = min(max(12.0, duration * 0.12), max(0.0, duration - 2.0))
     poster_cmd = [
         "ffmpeg", "-y", "-hide_banner",
-        "-i", input_path,
-        "-ss", "1", "-frames:v", "1",
+        "-ss", f"{poster_seek:.3f}", "-i", input_path,
+        "-frames:v", "1",
         "-q:v", "3", "-pix_fmt", "yuvj420p",
         os.path.join(output_dir, "poster.jpg"),
     ]
