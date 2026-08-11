@@ -16,7 +16,7 @@ COPY services/gateway /build/services/gateway
 RUN CGO_ENABLED=0 GOOS=linux go build -ldflags="-s -w" -o /gateway .
 
 # Runtime stage
-FROM alpine:3.23.5
+FROM alpine:3.24.1
 
 RUN apk add --no-cache ca-certificates tzdata wget
 

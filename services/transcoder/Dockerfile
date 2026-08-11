@@ -1,5 +1,5 @@
 # syntax=docker/dockerfile:1
-FROM python:3.11.15-slim
+FROM python:3.14.0-slim
 
 # Install FFmpeg (with libnvidia-encode available via LD_LIBRARY_PATH mount).
 # WSL2's NVIDIA user-space libs are mounted at /usr/lib/wsl/lib — see compose volumes.
