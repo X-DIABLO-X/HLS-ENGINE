@@ -1,4 +1,4 @@
-FROM golang:1.26.5-alpine AS builder
+FROM golang:1.26.6-alpine AS builder
 
 WORKDIR /build
 
@@ -12,7 +12,7 @@ RUN go mod download
 COPY services/auth /build/services/auth
 RUN CGO_ENABLED=0 GOOS=linux go build -ldflags="-s -w" -o /auth .
 
-FROM alpine:3.23.5
+FROM alpine:3.24.1
 
 RUN apk add --no-cache ca-certificates tzdata wget
 
