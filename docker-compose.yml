@@ -4,7 +4,7 @@ services:
   # ----------------------------------------------------------------------------
 
   postgres:
-    image: postgres:16.14-alpine
+    image: postgres:18.6-alpine
     container_name: hls-engine-postgres
     restart: unless-stopped
     environment:
@@ -25,7 +25,7 @@ services:
       - "127.0.0.1:${POSTGRES_PORT:-5432}:5432"
 
   redis:
-    image: redis:7.4.10-alpine
+    image: redis:8.10.1-alpine
     container_name: hls-engine-redis
     restart: unless-stopped
     command: redis-server --requirepass ${REDIS_PASSWORD:-change-me-redis-secret}
@@ -45,7 +45,7 @@ services:
       - "127.0.0.1:${REDIS_PORT:-6379}:6379"
 
   rabbitmq:
-    image: rabbitmq:4.3.4-management-alpine
+    image: rabbitmq:4.3.5-management-alpine
     container_name: hls-engine-rabbitmq
     restart: unless-stopped
     environment:
@@ -193,7 +193,7 @@ services:
       retries: 5
 
   prometheus:
-    image: prom/prometheus:v3.13.2
+    image: prom/prometheus:v3.14.0
     container_name: hls-engine-prometheus
     restart: unless-stopped
     command:
@@ -211,7 +211,7 @@ services:
       - "127.0.0.1:${PROMETHEUS_PORT:-9090}:9090"
 
   grafana:
-    image: grafana/grafana:13.1.1
+    image: grafana/grafana:13.2.0
     container_name: hls-engine-grafana
     restart: unless-stopped
     environment:
